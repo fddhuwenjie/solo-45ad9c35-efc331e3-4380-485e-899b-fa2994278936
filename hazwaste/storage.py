@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import sqlite3
 import threading
@@ -330,7 +331,6 @@ class Store:
                      payload: Dict[str, Any],
                      state: Dict[str, Dict[str, Any]]
                      ) -> Dict[str, Dict[str, Any]]:
-        import copy
         new_state = copy.deepcopy(state)
 
         if etype == "intake":
@@ -426,6 +426,21 @@ class Store:
                 raise StoreError(
                     "MERGE_INVALID",
                     "merge 需要 source_ids 与 target", 422)
+            # 拒绝重复 source_ids：同一源桶出现多次会被重复计入装量与
+            # 加权浓度，且会让合并后布局失真
+            seen_src: set = set()
+            dup_src = []
+            for s in sources:
+                if s in seen_src:
+                    dup_src.append(s)
+                seen_src.add(s)
+            if dup_src:
+                raise StoreError(
+                    "MERGE_DUPLICATE_SOURCE",
+                    f"source_ids 存在重复 {sorted(set(dup_src))}，"
+                    "同一源桶不得被重复计量", 422,
+                    {"duplicates": sorted(set(dup_src)),
+                     "source_ids": list(sources)})
             missing = [s for s in sources if s not in new_state]
             if missing:
                 raise StoreError("CONTAINER_NOT_FOUND",
@@ -447,13 +462,45 @@ class Store:
             if full_target["capacity_l"] is None:
                 raise StoreError("MERGE_INVALID",
                                  "target 需要 capacity_l", 422)
+            # 记录叶级溯源：若源桶本身也是合并产物，则展开到它的叶桶，
+            # 保留每个叶桶合并前的位置/装量/成分，供合并后复核禁配反应。
+            provenance = self._merge_provenance(sources, new_state)
             merged = engine.merge_containers(full_target, src_objs)
             merged["merged_from"] = list(sources)
+            merged["merge_provenance"] = provenance
             for s in sources:
                 new_state.pop(s, None)
             new_state[tid] = merged
 
         return new_state
+
+    @staticmethod
+    def _merge_provenance(source_ids: List[str],
+                          state: Dict[str, Dict[str, Any]]
+                          ) -> List[Dict[str, Any]]:
+        """展开合并源桶为叶级溯源记录（去重，按 id 排序保证可复算）。"""
+        leaves: Dict[str, Dict[str, Any]] = {}
+
+        def walk(sid: str):
+            obj = state.get(sid, {})
+            prov = obj.get("merge_provenance")
+            if prov:  # 源桶本身是早先的合并产物
+                for leaf in prov:
+                    leaves.setdefault(leaf["source_id"], dict(leaf))
+            else:
+                leaves.setdefault(sid, {
+                    "source_id": sid,
+                    "position": copy.deepcopy(obj.get("position")),
+                    "volume_l": obj.get("volume_l"),
+                    "capacity_l": obj.get("capacity_l"),
+                    "material": obj.get("material"),
+                    "components": copy.deepcopy(obj.get("components", [])),
+                    "hazard_classes": list(obj.get("hazard_classes", [])),
+                })
+
+        for sid in source_ids:
+            walk(sid)
+        return [leaves[k] for k in sorted(leaves)]
 
     @staticmethod
     def _require_container_fields(c: Any):

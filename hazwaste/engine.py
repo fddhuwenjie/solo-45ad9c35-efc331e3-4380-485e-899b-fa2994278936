@@ -77,15 +77,24 @@ def classify_components(
         # 与范围有正宽度交集的带：其类别至少“可能成立”。
         # 范围被阈值切成多段时，各段都出现的类别“确定成立”（取交集），
         # 仅部分段出现的类别只“可能成立”。单带完整覆盖时交集即该带类别。
+        # 点浓度（conc_min == conc_max，如 HCl [30,30]）按“该点是否落在
+        # 带内（含边界）”命中；点恰在阈值边界时相邻两带都命中，按多结论从严。
+        degenerate = hi - lo <= EPS
         segment_classes: List[Set[str]] = []
         for blo, bhi, classes in bands:
-            overlap = min(hi, bhi) - max(lo, blo)
-            if overlap <= EPS:  # 仅临界点相接（宽度 0）不算覆盖
+            if degenerate:
+                in_band = (blo - EPS <= lo <= bhi + EPS)
+                overlap = 0.0
+            else:
+                overlap = min(hi, bhi) - max(lo, blo)
+                in_band = overlap > EPS  # 仅临界点相接（宽度 0）不算覆盖
+            if not in_band:
                 continue
             covers_full = (lo >= blo - EPS) and (hi <= bhi + EPS)
             hits.append({"band": [blo, bhi], "classes": list(classes),
                          "overlap": round(max(0.0, overlap), 6),
-                         "covers_full_range": covers_full})
+                         "covers_full_range": covers_full,
+                         "point_concentration": degenerate})
             comp_pos.update(classes)
             segment_classes.append(set(classes))
         comp_def: Set[str] = (set.intersection(*segment_classes)
@@ -460,6 +469,15 @@ def evaluate_layout(matrix: Dict[str, Any], facility: Dict[str, Any],
             pair_details.append(detail)
             issues.extend(detail.pop("_issues"))
 
+    # ---- 合并桶自检：源桶废液在桶内混合，按合并前溯源两两核查禁配反应 ---- #
+    merge_details = []
+    for c in containers:
+        prov = c.get("merge_provenance")
+        if prov:
+            md = _evaluate_merge(matrix, c, prov)
+            merge_details.append(md)
+            issues.extend(md.pop("_issues"))
+
     # ---- 托盘盛漏核算 ---------------------------------------------------- #
     tray_details = _evaluate_trays(matrix, spatial, containers, located)
     for td in tray_details:
@@ -534,6 +552,7 @@ def evaluate_layout(matrix: Dict[str, Any], facility: Dict[str, Any],
                 "unknown": inferred[cid]["declared_unknown"],
             } for cid in ids},
             "pairs": pair_details,
+            "merges": merge_details,
             "trays": tray_details,
         },
         "fingerprint": result_fingerprint,
@@ -550,7 +569,101 @@ def _container_basis(c: Dict[str, Any]) -> Dict[str, Any]:
         "capacity_l": c.get("capacity_l"),
         "volume_l": c.get("volume_l"),
         "position": c.get("position"),
+        # 合并桶的禁配自检依赖叶级溯源，须纳入复算指纹输入
+        "merge_provenance": c.get("merge_provenance"),
     }
+
+
+# --------------------------------------------------------------------------- #
+# 合并桶自检：源桶废液在同一容器内直接混合（比泄漏共置更严格），
+# 依据合并前叶级溯源两两核查反应规则
+# --------------------------------------------------------------------------- #
+def _evaluate_merge(matrix: Dict[str, Any], target: Dict[str, Any],
+                    provenance: List[Dict[str, Any]]) -> Dict[str, Any]:
+    tid = target["id"]
+    out: Dict[str, Any] = {
+        "merged_container": tid,
+        "target_position": target.get("position"),
+        "source_containers": [p["source_id"] for p in provenance],
+        "source_positions": {p["source_id"]: p.get("position")
+                             for p in provenance},
+        "source_volumes_l": {p["source_id"]: p.get("volume_l")
+                             for p in provenance},
+        "pair_checks": [],
+        "_issues": [],
+    }
+    # 对每个叶级源桶按其合并前成分重新分类
+    leaf_cls: Dict[str, Dict[str, Any]] = {}
+    for p in provenance:
+        leaf_cls[p["source_id"]] = classify_components(
+            matrix, p.get("components", []))
+
+    for i in range(len(provenance)):
+        for j in range(i + 1, len(provenance)):
+            pa, pb = provenance[i], provenance[j]
+            ca, cb = leaf_cls[pa["source_id"]], leaf_cls[pb["source_id"]]
+            check: Dict[str, Any] = {
+                "sources": [pa["source_id"], pb["source_id"]],
+                "positions": {pa["source_id"]: pa.get("position"),
+                              pb["source_id"]: pb.get("position")},
+                "matched_rules": [],
+                "possible_rules": [],
+                "violations": [],
+            }
+            matched: Dict[str, Dict[str, Any]] = {}
+            for x, y in product(ca["definite"], cb["definite"]):
+                r = M.find_reaction(matrix, x, y)
+                if r:
+                    matched[r["id"]] = {"rule_id": r["id"],
+                                        "class_pair": [x, y],
+                                        "definite": True}
+            possible: Dict[str, Dict[str, Any]] = {}
+            for x, y in product(ca["possible"], cb["possible"]):
+                r = M.find_reaction(matrix, x, y)
+                if r and r["id"] not in matched:
+                    possible[r["id"]] = {"rule_id": r["id"],
+                                         "class_pair": [x, y],
+                                         "definite": False}
+            check["matched_rules"] = list(matched.values())
+            check["possible_rules"] = list(possible.values())
+
+            rules = [(rid, next(x for x in matrix["reactions"]
+                                if x["id"] == rid), True)
+                     for rid in matched]
+            rules += [(rid, next(x for x in matrix["reactions"]
+                                 if x["id"] == rid), False)
+                      for rid in possible]
+            for rid, rule, definite in rules:
+                # 桶内直接混合：任何反应规则都构成禁配（不区分共置层级）
+                sev = rule["severity"]
+                gas = f"，释放 {rule['gas']}" if rule.get("gas") else ""
+                code = ("MERGE_INCOMPATIBLE" if definite
+                        else "MERGE_POSSIBLY_INCOMPATIBLE")
+                check["violations"].append({
+                    "rule_id": rid, "definite": definite,
+                    "severity": sev, "gas": rule.get("gas")})
+                out["_issues"].append(_issue(
+                    code, "blocker", "merge",
+                    f"合并桶 {tid} 混合了禁配废液: 源桶 {pa['source_id']} 与 "
+                    f"{pb['source_id']} 命中规则 {rid}（{sev}{gas}："
+                    f"{rule.get('note', '')}）",
+                    # 涉事容器含目标桶与两个源桶
+                    [tid, pa["source_id"], pb["source_id"]],
+                    {tid: target.get("position"),
+                     pa["source_id"]: pa.get("position"),
+                     pb["source_id"]: pb.get("position")},
+                    {"rule_id": rid, "rule": rule, "definite": definite,
+                     "merged_container": tid,
+                     "source_pair": [pa["source_id"], pb["source_id"]],
+                     "source_positions": {
+                         pa["source_id"]: pa.get("position"),
+                         pb["source_id"]: pb.get("position")},
+                     "source_volumes_l": {
+                         pa["source_id"]: pa.get("volume_l"),
+                         pb["source_id"]: pb.get("volume_l")},
+                     "mixed_context": "in_container"}))
+            out["pair_checks"].append(check)
+    return out
 
 
 # --------------------------------------------------------------------------- #

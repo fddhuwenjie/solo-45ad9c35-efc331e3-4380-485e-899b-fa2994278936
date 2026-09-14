@@ -66,6 +66,37 @@ class ClassificationTests(unittest.TestCase):
             self.m, [{"name": "mystery_x", "conc_min": 1, "conc_max": 2}])
         self.assertEqual(out["unknown_components"], ["mystery_x"])
 
+    def test_point_concentration_hits_band(self):
+        # 缺陷回归：HCl [30,30] 点浓度必须命中唯一阈值带，
+        # 确定类别为 acid+corrosive，且不产生多结论
+        out = engine.classify_components(
+            self.m, [{"name": "hcl", "conc_min": 30, "conc_max": 30}])
+        self.assertEqual(out["definite"], ["acid", "corrosive"])
+        self.assertEqual(out["possible"], ["acid", "corrosive"])
+        self.assertFalse(out["ambiguous"])
+        self.assertEqual(len(out["band_hits"][0]["bands"]), 1)
+        hit = out["band_hits"][0]["bands"][0]
+        self.assertTrue(hit["point_concentration"])
+        self.assertTrue(hit["covers_full_range"])
+
+    def test_point_concentration_on_threshold_is_strict(self):
+        # 点浓度恰落在 1% 阈值边界 -> 相邻两带都命中，按多结论从严
+        out = engine.classify_components(
+            self.m, [{"name": "nacn", "conc_min": 1.0, "conc_max": 1.0}])
+        self.assertTrue(out["ambiguous"])
+        self.assertIn("cyanide", out["possible"])
+
+    def test_point_concentration_layout(self):
+        # 端到端：点浓度酸桶应被正确分类，单独合规存放时可处置
+        fac = facility()
+        a = acid()
+        a["components"] = [{"name": "hcl", "conc_min": 30, "conc_max": 30}]
+        res = engine.evaluate_layout(self.m, fac, [a])
+        self.assertEqual(res["disposition"], "disposable",
+                         msg=json.dumps(res["issues"], ensure_ascii=False))
+        pc = res["calculation"]["classification"]["A1"]
+        self.assertEqual(pc["definite"], ["acid", "corrosive"])
+
 
 class LayoutTests(unittest.TestCase):
     def setUp(self):
@@ -243,6 +274,109 @@ class LayoutTests(unittest.TestCase):
         self.assertAlmostEqual(comp["hcl"]["conc_max"], 12.0)
         self.assertEqual(merged["volume_l"], 100)
 
+    def _merged_acid_cyanide(self, target_cap=60, tray="T-a2"):
+        """模拟 storage 的合并：20L 酸 + 20L 含氰 -> 目标桶，附叶级溯源。"""
+        a = acid()
+        k = cyanide()
+        target = {"id": "M1", "material": "hdpe",
+                  "capacity_l": target_cap,
+                  "position": {"cabinet_id": "CAB-A", "zone_id": "Z-acid",
+                               "tray_id": tray}}
+        merged = engine.merge_containers(target, [a, k])
+        merged["merged_from"] = ["A1", "K1"]
+        merged["merge_provenance"] = [
+            {"source_id": "A1", "position": a["position"],
+             "volume_l": a["volume_l"], "capacity_l": a["capacity_l"],
+             "material": a["material"], "components": a["components"],
+             "hazard_classes": a["hazard_classes"]},
+            {"source_id": "K1", "position": k["position"],
+             "volume_l": k["volume_l"], "capacity_l": k["capacity_l"],
+             "material": k["material"], "components": k["components"],
+             "hazard_classes": k["hazard_classes"]},
+        ]
+        return merged
+
+    def test_merge_incompatible_acid_cyanide_flagged(self):
+        # 缺陷回归：酸液与含氰液合并后，待处置结果必须给出
+        # R1 / HCN / 两个源桶 / 各自位置 / 依据
+        merged = self._merged_acid_cyanide()
+        res = engine.evaluate_layout(self.m, self.fac, [merged])
+        self.assertEqual(res["disposition"], "pending")
+        iss = [i for i in res["issues"]
+               if i["code"] == "MERGE_INCOMPATIBLE"]
+        self.assertEqual(len(iss), 1)
+        i = iss[0]
+        self.assertEqual(i["basis"]["rule_id"], "R1")
+        self.assertEqual(i["basis"]["rule"]["gas"], "HCN")
+        self.assertEqual(set(i["containers"]), {"M1", "A1", "K1"})
+        # 两个源桶合并前的位置都要返回
+        self.assertEqual(i["basis"]["source_positions"]["A1"]["tray_id"],
+                         "T-a1")
+        self.assertEqual(i["basis"]["source_positions"]["K1"]["tray_id"],
+                         "T-c1")
+        self.assertEqual(i["positions"]["A1"]["tray_id"], "T-a1")
+        self.assertEqual(i["positions"]["K1"]["tray_id"], "T-c1")
+        # 计算明细中的 merges 段同样可追溯
+        md = res["calculation"]["merges"][0]
+        self.assertEqual(md["source_containers"], ["A1", "K1"])
+        pair = md["pair_checks"][0]
+        self.assertEqual(pair["sources"], ["A1", "K1"])
+        self.assertEqual(pair["matched_rules"][0]["rule_id"], "R1")
+
+    def test_merge_volume_fill_and_tray_not_distorted(self):
+        # 缺陷回归：合并后装量=源桶装量之和（不重复计量），装填率与
+        # 盛漏按目标桶/目标托盘如实计算
+        merged = self._merged_acid_cyanide(target_cap=60, tray="T-a2")
+        res = engine.evaluate_layout(self.m, self.fac, [merged])
+        # 装量 40L，不因溯源而重复累加
+        self.assertEqual(merged["volume_l"], 40)
+        pc = next(x for x in res["per_container"]
+                  if x["container_id"] == "M1")
+        self.assertAlmostEqual(pc["fill_ratio"], 40 / 60, places=6)
+        # 托盘 T-a2 公称 200L -> 有效 180L；需 40*1.1=44L，充足
+        tray = next(t for t in res["calculation"]["trays"]
+                    if t["tray_id"] == "T-a2")
+        self.assertEqual(tray["containers"], ["M1"])
+        self.assertEqual(tray["total_volume_l"], 40)
+        self.assertEqual(tray["required_containment_l"], 44.0)
+        self.assertEqual(tray["usable_capacity_l"], 180.0)
+        self.assertTrue(tray["sufficient"])
+        # 除合并禁配外不应出现盛漏/装填类问题
+        codes = {i["code"] for i in res["issues"]}
+        self.assertNotIn("TRAY_CONTAINMENT_INSUFFICIENT", codes)
+        self.assertNotIn("FILL_OVERFLOW", codes)
+
+    def test_merge_chained_provenance_classifies_leaves(self):
+        # 链式合并：M1(酸) 再与含氰桶合并，叶级溯源展开后仍须命中 R1
+        first = self._merged_acid_cyanide()  # M1 含 A1,K1 溯源但已禁配
+        # 构造一个“只含酸”的中间合并桶，再与含氰桶合并
+        a = acid()
+        mid_target = {"id": "MID", "material": "hdpe", "capacity_l": 60,
+                      "position": a["position"]}
+        mid = engine.merge_containers(mid_target, [a])
+        mid["merged_from"] = ["A1"]
+        mid["merge_provenance"] = [{
+            "source_id": "A1", "position": a["position"],
+            "volume_l": a["volume_l"], "capacity_l": a["capacity_l"],
+            "material": a["material"], "components": a["components"],
+            "hazard_classes": a["hazard_classes"]}]
+        k = cyanide()
+        t2 = {"id": "M2", "material": "hdpe", "capacity_l": 60,
+              "position": {"cabinet_id": "CAB-A", "zone_id": "Z-acid",
+                           "tray_id": "T-a2"}}
+        final = engine.merge_containers(t2, [mid, k])
+        # 复刻 storage._merge_provenance 的叶展开逻辑
+        from hazwaste.storage import Store
+        state = {"MID": mid, "K1": k}
+        final["merge_provenance"] = Store._merge_provenance(["MID", "K1"],
+                                                            state)
+        res = engine.evaluate_layout(self.m, self.fac, [final])
+        iss = [i for i in res["issues"]
+               if i["code"] == "MERGE_INCOMPATIBLE"]
+        self.assertTrue(any(i["basis"]["rule_id"] == "R1" for i in iss))
+        leaf_ids = {p["source_id"] for p in final["merge_provenance"]}
+        self.assertEqual(leaf_ids, {"A1", "K1"})
+
 
 class MatrixTests(unittest.TestCase):
     def test_validate_catches_duplicate_pair(self):
@@ -259,6 +393,61 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in d["reactions_added"]], ["R8"])
         r3 = next(r for r in d["reactions_changed"] if r["rule_id"] == "R3")
         self.assertEqual(r3["fields"]["min_distance_m"]["new"], 1.5)
+
+
+class MergeStorageTests(unittest.TestCase):
+    """合并事件在存储层的边界。"""
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.store.put_facility("F1", facility())
+
+    def _intake(self, c):
+        state = self.store.replay_state("F1")
+        state = self.store._apply_event(
+            "intake", c["id"], {"container": c}, state)
+        return state
+
+    def test_duplicate_source_ids_rejected(self):
+        a = acid()
+        k = cyanide()
+        state = self._intake(a)
+        state = self.store._apply_event(
+            "intake", k["id"], {"container": k}, state)
+        target = {"id": "M1", "material": "hdpe", "capacity_l": 60,
+                  "position": {"cabinet_id": "CAB-A", "zone_id": "Z-acid",
+                               "tray_id": "T-a2"}}
+        with self.assertRaises(StoreError) as ctx:
+            self.store._apply_event(
+                "merge", None,
+                {"source_ids": ["A1", "K1", "A1"], "target": target}, state)
+        self.assertEqual(ctx.exception.code, "MERGE_DUPLICATE_SOURCE")
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.detail["duplicates"], ["A1"])
+        # 被拒绝的合并不产生任何状态变化：两个源桶都还在
+        self.assertIn("A1", state)
+        self.assertIn("K1", state)
+        self.assertNotIn("M1", state)
+
+    def test_duplicate_source_would_otherwise_double_count(self):
+        # 正常合并 [A1,K1] 装量=40；若不去重 [A1,A1] 会把 20L 算成 40/60，
+        # 这里直接验证合法路径装量与浓度不失真
+        a = acid()
+        k = cyanide()
+        state = self._intake(a)
+        state = self.store._apply_event(
+            "intake", k["id"], {"container": k}, state)
+        target = {"id": "M1", "material": "hdpe", "capacity_l": 60,
+                  "position": {"cabinet_id": "CAB-A", "zone_id": "Z-acid",
+                               "tray_id": "T-a2"}}
+        state = self.store._apply_event(
+            "merge", None,
+            {"source_ids": ["A1", "K1"], "target": target}, state)
+        self.assertEqual(state["M1"]["volume_l"], 40)
+        self.assertEqual(len(state["M1"]["merge_provenance"]), 2)
+        self.assertEqual(sorted(p["source_id"]
+                                for p in state["M1"]["merge_provenance"]),
+                         ["A1", "K1"])
 
 
 if __name__ == "__main__":

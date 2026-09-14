@@ -294,11 +294,127 @@ class ApiTests(unittest.TestCase):
                                            "zone_id": "Z-org",
                                            "tray_id": "T-g1"}}}}})
         self.assertEqual(st, 201, resp)
-        st, rev = self.api.get("/revisions/latest")
+        st, rev = self.api.get(
+            f"/revisions/latest?facility_id={self.fid}")
         self.assertIn("M1", rev["state"])
         self.assertNotIn("A1", rev["state"])
         comps = {c["name"] for c in rev["state"]["M1"]["components"]}
         self.assertEqual(comps, {"hcl", "h2o2"})
+
+    def test_09b_merge_acid_cyanide_returns_r1_with_sources(self):
+        # 缺陷回归：酸液与含氰液合并，待处置结果须含 R1/HCN/两个源桶/
+        # 各自位置/依据；且合并装量、装填率、盛漏计算不失真
+        self._intake(ACID, "2026-09-14T09:00:00Z", event_id="m-acid")
+        self._intake(CYAN, "2026-09-14T09:05:00Z", event_id="m-cyan")
+        st, resp = self.api.post(
+            f"/facilities/{self.fid}/events",
+            {"matrix_version": "1.0", "event": {
+                "ts": "2026-09-14T12:00:00Z", "type": "merge",
+                "payload": {"source_ids": ["A1", "K1"],
+                            "target": {"id": "M1", "material": "hdpe",
+                                       "capacity_l": 60,
+                                       "position": {
+                                           "cabinet_id": "CAB-A",
+                                           "zone_id": "Z-acid",
+                                           "tray_id": "T-a2"}}}}})
+        self.assertEqual(st, 201, resp)
+        self.assertEqual(resp["latest"], "pending")
+        rev_id = resp["revisions"][-1]["revision_id"]
+        st, rev = self.api.get(f"/revisions/{rev_id}")
+
+        issue = next(i for i in rev["result"]["issues"]
+                     if i["code"] == "MERGE_INCOMPATIBLE")
+        self.assertEqual(issue["basis"]["rule_id"], "R1")
+        self.assertEqual(issue["basis"]["rule"]["gas"], "HCN")
+        self.assertEqual(set(issue["containers"]), {"M1", "A1", "K1"})
+        self.assertEqual(issue["basis"]["source_positions"]["A1"],
+                         ACID["position"])
+        self.assertEqual(issue["basis"]["source_positions"]["K1"],
+                         CYAN["position"])
+        self.assertEqual(issue["positions"]["A1"]["tray_id"], "T-a1")
+        self.assertEqual(issue["positions"]["K1"]["tray_id"], "T-c1")
+
+        # 合并后装量 40L（不重复计量）、装填率 40/60
+        self.assertEqual(rev["state"]["M1"]["volume_l"], 40)
+        pc = next(x for x in rev["result"]["per_container"]
+                  if x["container_id"] == "M1")
+        self.assertAlmostEqual(pc["fill_ratio"], 40 / 60, places=6)
+        # 盛漏：T-a2 公称 200L 有效 180L；需 40*1.1=44L，充足
+        tray = next(t for t in rev["result"]["calculation"]["trays"]
+                    if t["tray_id"] == "T-a2")
+        self.assertEqual(tray["containers"], ["M1"])
+        self.assertEqual(tray["total_volume_l"], 40)
+        self.assertEqual(tray["required_containment_l"], 44.0)
+        self.assertTrue(tray["sufficient"])
+        codes = {i["code"] for i in rev["result"]["issues"]}
+        self.assertNotIn("TRAY_CONTAINMENT_INSUFFICIENT", codes)
+        self.assertNotIn("FILL_OVERFLOW", codes)
+
+        # 待处置不可确认
+        st, err = self.api.post(f"/revisions/{rev_id}/confirm", {})
+        self.assertEqual(st, 409)
+        self.assertEqual(err["error"]["code"], "CONFIRM_BLOCKED")
+
+        # 逐桶处置单含合并自检段与源桶依据
+        st, sh = self.api.get(
+            f"/revisions/{rev_id}/disposal?container_id=M1")
+        self.assertEqual(st, 200)
+        self.assertEqual(sh["container_disposition"], "pending")
+        self.assertAlmostEqual(sh["fill_check"]["fill_ratio"], 40 / 60,
+                               places=6)
+        mc = sh["merge_self_check"]
+        self.assertEqual(mc["source_containers"], ["A1", "K1"])
+        self.assertEqual(mc["pair_checks"][0]["matched_rules"][0]["rule_id"],
+                         "R1")
+        self.assertTrue(any("R1" in a for a in sh["required_actions"]))
+
+        # 复算 JSON：冻结矩阵重算，指纹一致，计算明细保留
+        st, rc = self.api.post(f"/revisions/{rev_id}/recalc", {})
+        self.assertEqual(st, 200)
+        self.assertTrue(rc["verified"])
+        self.assertEqual(rc["recalculated_fingerprint"],
+                         rc["stored_fingerprint"])
+        merge_calc = [m for m in rc["result"]["calculation"]["merges"]
+                      if m["merged_container"] == "M1"]
+        self.assertEqual(
+            merge_calc[0]["pair_checks"][0]["matched_rules"][0]["rule_id"],
+            "R1")
+
+    def test_09c_merge_duplicate_source_ids_rejected(self):
+        # 缺陷回归：重复 source_ids 返回 422，状态不变，不产生修订
+        self._intake(ACID, "2026-09-14T09:00:00Z", event_id="d-acid")
+        self._intake(CYAN, "2026-09-14T09:05:00Z", event_id="d-cyan")
+        revs_before = self.api.get(
+            f"/revisions?facility_id={self.fid}")[1]["revisions"]
+        st, err = self.api.post(
+            f"/facilities/{self.fid}/events",
+            {"matrix_version": "1.0", "event": {
+                "ts": "2026-09-14T12:00:00Z", "type": "merge",
+                "payload": {"source_ids": ["A1", "K1", "A1"],
+                            "target": {"id": "M1", "material": "hdpe",
+                                       "capacity_l": 60}}}})
+        self.assertEqual(st, 422)
+        self.assertEqual(err["error"]["code"], "MERGE_DUPLICATE_SOURCE")
+        self.assertEqual(err["error"]["detail"]["duplicates"], ["A1"])
+        revs_after = self.api.get(
+            f"/revisions?facility_id={self.fid}")[1]["revisions"]
+        self.assertEqual(len(revs_after), len(revs_before))
+        st, ev = self.api.get(f"/events?facility_id={self.fid}")
+        self.assertEqual(
+            [e["type"] for e in ev["events"]], ["intake", "intake"])
+
+    def test_09d_point_concentration_intake_classified(self):
+        # 缺陷回归：HCl [30,30] 点浓度入库被正确判定为酸，布局可处置
+        point_acid = json.loads(json.dumps(ACID))
+        point_acid["components"] = [
+            {"name": "hcl", "conc_min": 30, "conc_max": 30}]
+        st, resp = self._intake(point_acid, "2026-09-14T09:00:00Z")
+        self.assertEqual(resp["latest"], "disposable", resp)
+        rid = resp["revisions"][-1]["revision_id"]
+        st, rev = self.api.get(f"/revisions/{rid}")
+        cls = rev["result"]["calculation"]["classification"]["A1"]
+        self.assertEqual(cls["definite"], ["acid", "corrosive"])
+        self.assertFalse(cls["ambiguous"])
 
     def test_10_repack_event_new_container(self):
         self._intake(ACID, "2026-09-14T09:00:00Z")

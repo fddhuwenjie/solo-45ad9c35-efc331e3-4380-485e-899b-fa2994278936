@@ -79,6 +79,13 @@ def build_disposal_sheet(rev: Dict[str, Any],
                                    "sum(volume_l) * tray_capacity_ratio")
                 break
 
+    # ---- 合并自检明细（源桶两两禁配核查） ----
+    merge_check = None
+    for m in calc.get("merges", []):
+        if m["merged_container"] == container_id:
+            merge_check = {k: v for k, v in m.items() if k != "_issues"}
+            break
+
     # ---- 本桶相关问题（含阻断与警告），给出依据与整改建议 ----
     my_issues = [i for i in result["issues"]
                  if container_id in i["containers"]]
@@ -106,6 +113,7 @@ def build_disposal_sheet(rev: Dict[str, Any],
             "components": c.get("components", []),
             "declared_hazard_classes": c.get("hazard_classes", []),
             "merged_from": c.get("merged_from"),
+            "merge_provenance": c.get("merge_provenance"),
             "replaced_from": c.get("replaced_from"),
         },
         "classification_detail": {
@@ -119,6 +127,7 @@ def build_disposal_sheet(rev: Dict[str, Any],
         },
         "fill_check": fill_detail,
         "pair_checks": pairs,
+        "merge_self_check": merge_check,
         "tray_containment_check": tray,
         "issues": [{
             "code": i["code"],
@@ -166,6 +175,11 @@ def _remediations(issue: Dict[str, Any], cid: str) -> List[str]:
                     f"{rule.get('same_ventilation')}"]
         if coloc == M.COLOC_TRAY:
             return [f"将 {cid} 与 {other_s} 分到不同盛漏托盘"]
+    if code in ("MERGE_INCOMPATIBLE", "MERGE_POSSIBLY_INCOMPATIBLE"):
+        src = issue.get("basis", {}).get("source_pair", [])
+        return [f"禁止该合并：源桶 {src} 在桶内混合会触发规则 "
+                f"{rule.get('id')}（{rule.get('note', '')}）；"
+                "应分桶分柜存放，不得并入同一容器"]
     if code == "TRAY_CONTAINMENT_INSUFFICIENT":
         d = issue["basis"].get("deficit_l")
         return [f"更换更大托盘或分装，盛漏有效容积至少增加 {d}L"
