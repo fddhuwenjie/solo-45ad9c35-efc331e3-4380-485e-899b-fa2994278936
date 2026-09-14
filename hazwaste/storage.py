@@ -3,8 +3,9 @@
 不可改写原则：
 - matrices：冻结后只可 INSERT；
 - events：事件日志只可 INSERT，按 (ts, seq) 顺序回放；
-- revisions：每次入库/移位/合并/更正/换桶都产生新修订行，旧行永不更新；
-- trials：试排/移动预检的计算结果同样落库冻结；
+- revisions：每次入库/移位/合并/部分转移/更正/换桶都产生新修订行，旧行永不更新；
+  转移一旦落库不得改写，更正只能追加反向/补偿转移事件；
+- trials：试排/移动预检/转移预检的计算结果同样落库冻结；
 - confirmations：确认不回写修订，而是新增确认记录引用修订；
 - facility_versions：设施（柜体/分区/托盘/通风）定义也按版本追加。
 """
@@ -247,7 +248,7 @@ class Store:
     # ------------------------------------------------------------------ #
     # 事件日志
     # ------------------------------------------------------------------ #
-    EVENT_TYPES = {"intake", "move", "merge", "correct", "repack"}
+    EVENT_TYPES = {"intake", "move", "merge", "correct", "repack", "transfer"}
 
     def append_event(self, event: Dict[str, Any], facility_id: str,
                      matrix_version: str,
@@ -256,6 +257,8 @@ class Store:
         """校验并追加单个事件，随后全量重放出新修订（每次移动后重算布局）。
 
         整个“校验时标 -> 重放 -> 应用 -> 入库 -> 出修订”在同一把锁内完成。
+        部分转移（transfer）在应用前即加载冻结矩阵做禁配准入预检，
+        任何校验失败都在 INSERT 之前抛出，当前状态不变。
         """
         etype = event.get("type")
         if etype not in self.EVENT_TYPES:
@@ -269,6 +272,11 @@ class Store:
         payload = event.get("payload") or {}
         cid = event.get("container_id") or payload.get("container_id")
         event_id = event.get("event_id") or new_id("evt")
+        if etype == "transfer":
+            # 事件主桶记为源桶；批次号在此注入并随事件落库，
+            # 回放时从同一 payload 重建，保证批次号稳定可复算
+            cid = cid or payload.get("source_id")
+            payload.setdefault("batch_id", new_id("b"))
 
         with self.lock:
             last = self.conn.execute(
@@ -284,11 +292,18 @@ class Store:
             if floor is not None and ts < floor:
                 raise StoreError(
                     "EVENT_TS_OUT_OF_ORDER",
-                    f"事件时标 {ts} 早于本设施已有最新事件 {floor}", 409)
+                    f"事件时标 {ts} 早于本设施已有最新事件 {floor}", 409,
+                    {"event_ts": ts, "last_ts": floor,
+                     "last_event_id": last["event_id"] if last else None})
 
             state = self.replay_state(facility_id)
+            # 转移准入需要冻结矩阵（禁配预检）；矩阵不存在时在任何写入前 404
+            matrix = self.load_matrix(matrix_version) \
+                if etype == "transfer" else None
             try:
-                new_state = self._apply_event(etype, cid, payload, state)
+                new_state = self._apply_event(
+                    etype, cid, payload, state,
+                    matrix=matrix, ts=ts, event_id=event_id)
             except StoreError:
                 raise
             except Exception as exc:  # 防御性：任何应用异常转为 4xx
@@ -306,7 +321,7 @@ class Store:
                 seq = cur.lastrowid
 
             facility = self.get_facility(facility_id)
-            matrix = self.load_matrix(matrix_version)
+            matrix = matrix or self.load_matrix(matrix_version)
             return self._create_revision(
                 new_state, facility, matrix, kind=etype,
                 trigger_seq=seq, trigger_event_id=event_id, created_ts=ts)
@@ -329,8 +344,17 @@ class Store:
 
     def _apply_event(self, etype: str, cid: Optional[str],
                      payload: Dict[str, Any],
-                     state: Dict[str, Dict[str, Any]]
+                     state: Dict[str, Dict[str, Any]],
+                     matrix: Optional[Dict[str, Any]] = None,
+                     ts: Optional[str] = None,
+                     event_id: Optional[str] = None
                      ) -> Dict[str, Dict[str, Any]]:
+        """把单个事件套用到状态上（纯状态转移，失败抛错、入参状态不变）。
+
+        matrix 仅在事件准入需要冻结规则时传入（transfer 的禁配预检）；
+        回放历史事件时不传 matrix——准入校验在追加当时已完成，回放只
+        重放确定性的体积/成分演化。
+        """
         new_state = copy.deepcopy(state)
 
         if etype == "intake":
@@ -472,7 +496,317 @@ class Store:
                 new_state.pop(s, None)
             new_state[tid] = merged
 
+        elif etype == "transfer":
+            self._apply_transfer(payload, new_state, matrix, ts, event_id)
+
         return new_state
+
+    # ------------------------------------------------------------------ #
+    # 部分转移（过桶）：体积守恒 + 批次溯源 + 准入校验
+    # ------------------------------------------------------------------ #
+    def _apply_transfer(self, payload: Dict[str, Any],
+                        new_state: Dict[str, Dict[str, Any]],
+                        matrix: Optional[Dict[str, Any]],
+                        ts: Optional[str],
+                        event_id: Optional[str]):
+        """把 payload 描述的部分转移套用到 new_state（就地修改）。
+
+        校验顺序：同源同桶 -> 桶存在 -> 操作者 -> 体积合法/超量 ->
+        取样与源桶冻结成分交集 -> 声明数量闭合 -> 反向更正引用 ->
+        禁配预检（需 matrix）。任何一步失败抛 StoreError，状态不变。
+        """
+        src_id = payload.get("source_id")
+        tgt_id = payload.get("target_id")
+        if not src_id or not tgt_id:
+            raise StoreError("TRANSFER_INVALID",
+                             "transfer 需要 source_id 与 target_id", 422)
+        if src_id == tgt_id:
+            raise StoreError(
+                "TRANSFER_SAME_CONTAINER",
+                f"源桶与目标桶相同（{src_id}），部分转移不成立", 422,
+                {"source_id": src_id, "target_id": tgt_id})
+        if src_id not in new_state:
+            raise StoreError("CONTAINER_NOT_FOUND",
+                             f"源桶 {src_id} 不存在，无法转移", 404,
+                             {"source_id": src_id, "target_id": tgt_id})
+        if tgt_id not in new_state:
+            raise StoreError("CONTAINER_NOT_FOUND",
+                             f"目标桶 {tgt_id} 不存在，无法转移", 404,
+                             {"source_id": src_id, "target_id": tgt_id})
+        operator = payload.get("operator")
+        if not operator or not str(operator).strip():
+            raise StoreError("TRANSFER_INVALID",
+                             "transfer 事件必须写明操作者 operator", 422)
+        try:
+            tvol = float(payload.get("volume_l"))
+        except (TypeError, ValueError):
+            raise StoreError(
+                "TRANSFER_INVALID",
+                f"转移体积非数值: {payload.get('volume_l')}", 422)
+        if not tvol > 0:
+            raise StoreError("TRANSFER_INVALID",
+                             f"转移体积须为正数: {tvol}", 422)
+
+        src = new_state[src_id]
+        tgt = new_state[tgt_id]
+        src_vol = float(src["volume_l"])
+        tgt_vol = float(tgt["volume_l"])
+        batch_id = payload.get("batch_id") or new_id("b")
+        # 容差内的浮点尾差可能出现 -0.0，钳到 0
+        new_src_vol = max(0.0, round(src_vol - tvol, 6))
+        new_tgt_vol = round(tgt_vol + tvol, 6)
+
+        # ---- 转移超量 -------------------------------------------------- #
+        if tvol > src_vol + engine.EPS:
+            raise StoreError(
+                "TRANSFER_EXCEEDS_SOURCE",
+                f"转移 {tvol}L 超过源桶 {src_id} 现存 {src_vol}L", 409,
+                {"source_id": src_id, "target_id": tgt_id,
+                 "batch_id": batch_id,
+                 "requested_l": tvol, "source_volume_l": src_vol,
+                 "deficit_l": round(tvol - src_vol, 6),
+                 "source_batches": [b.get("batch_id") for b in
+                                    src.get("transfer_batches", [])],
+                 "basis": "按体积守恒扣减源桶，转出量不得大于现存量"})
+
+        # ---- 取样成分：与源桶冻结成分逐成分求交集 ---------------------- #
+        src_comps = src.get("components", [])
+        comp_basis = "source_frozen"
+        aliquot_comps = copy.deepcopy(src_comps)
+        sample = payload.get("sample_components")
+        sample_intersection = None
+        if sample is not None:
+            aliquot_comps, sample_intersection = self._validate_sample(
+                sample, src_comps, src_id, tgt_id, batch_id)
+            comp_basis = "sample"
+
+        # ---- 数量闭合：声明的转移后数量须与体积守恒计算一致 ------------ #
+        expect = payload.get("expect") or {}
+        mismatches: Dict[str, Any] = {}
+        for key, computed in (("source_remaining_l", new_src_vol),
+                              ("target_total_l", new_tgt_vol)):
+            if key not in expect:
+                continue
+            try:
+                declared = float(expect[key])
+            except (TypeError, ValueError):
+                declared = None
+            if declared is None or abs(declared - computed) \
+                    > engine.TRANSFER_VOL_TOL:
+                mismatches[key] = {"declared": expect[key],
+                                   "computed": computed}
+        if mismatches:
+            raise StoreError(
+                "TRANSFER_NOT_BALANCED",
+                "声明的转移后数量与体积守恒计算不闭合: "
+                + "; ".join(f"{k} 声明 {v['declared']} ≠ 计算 {v['computed']}"
+                            for k, v in mismatches.items()),
+                409,
+                {"source_id": src_id, "target_id": tgt_id,
+                 "batch_id": batch_id,
+                 "mismatches": mismatches,
+                 "source_volume_l": src_vol, "target_volume_l": tgt_vol,
+                 "transfer_l": tvol,
+                 "formula": "source_remaining = source_volume − transfer; "
+                            "target_total = target_volume + transfer",
+                 "tolerance_l": engine.TRANSFER_VOL_TOL})
+
+        # ---- 反向/补偿更正：引用已落库的转移事件，方向必须相反 --------- #
+        reversal_of = payload.get("reversal_of")
+        if reversal_of is not None:
+            self._validate_reversal(reversal_of, src_id, tgt_id, tvol)
+
+        # ---- 禁配预检：转入液 vs 目标桶现存批次（冻结矩阵） ------------- #
+        if matrix is not None:
+            conflicts = engine.transfer_conflicts(matrix, aliquot_comps, tgt)
+            if conflicts:
+                rules_hit = sorted({
+                    r["rule_id"] for c in conflicts
+                    for r in c["matched_rules"] + c["possible_rules"]})
+                raise StoreError(
+                    "TRANSFER_INCOMPATIBLE",
+                    f"转移会向目标桶 {tgt_id} 混入禁配物，命中规则 "
+                    f"{', '.join(rules_hit)}；已拒绝，状态不变", 409,
+                    {"source_id": src_id, "target_id": tgt_id,
+                     "batch_id": batch_id,
+                     "target_batches": [b.get("batch_id") for b in
+                                        tgt.get("transfer_batches", [])],
+                     "aliquot_components": aliquot_comps,
+                     "composition_basis": comp_basis,
+                     "rules_hit": rules_hit,
+                     "conflicts": conflicts,
+                     "basis": "转入液与目标桶现存批次按冻结矩阵逐批核对反应"
+                              "规则，确定/可能命中均拒绝"})
+
+        # ---- 通过全部校验：按体积守恒改写两桶 -------------------------- #
+        if tgt_vol <= engine.EPS:
+            new_comps = copy.deepcopy(aliquot_comps)
+        else:
+            new_comps = engine.merge_components([
+                {"volume_l": tgt_vol, "components": tgt.get("components", [])},
+                {"volume_l": tvol, "components": aliquot_comps}])
+
+        # 目标桶批次链：首次转入时把现存内容折算为基线批次，此后只追加
+        batches = copy.deepcopy(tgt.get("transfer_batches") or [])
+        if not batches:
+            batches.append({
+                "batch_id": f"b_base_{tgt_id}",
+                "kind": "base",
+                "event_id": None, "ts": None,
+                "from_container": None, "to_container": tgt_id,
+                "volume_l": tgt_vol,
+                "components": copy.deepcopy(tgt.get("components", [])),
+                "operator": None,
+                "reason": "入库原始成分（首次转入前折算为基线批次）",
+                "source_batch_ids": []})
+        batches.append({
+            "batch_id": batch_id,
+            "kind": "transfer_in",
+            "event_id": event_id,
+            "ts": ts,
+            "from_container": src_id,
+            "to_container": tgt_id,
+            "volume_l": round(tvol, 6),
+            "components": copy.deepcopy(aliquot_comps),
+            "composition_basis": comp_basis,
+            "sample_components": copy.deepcopy(sample) if sample else None,
+            "sample_source_intersection": sample_intersection,
+            "operator": operator,
+            "reason": payload.get("reason"),
+            "reversal_of": reversal_of,
+            # 递归追溯：记录源桶当时的批次链，可沿批次号向上展开
+            "source_batch_ids": [b.get("batch_id") for b in
+                                 src.get("transfer_batches", [])],
+            "source_declared_classes": list(src.get("hazard_classes", [])),
+            "source_volume_before_l": src_vol,
+            "source_volume_after_l": new_src_vol,
+            "target_volume_before_l": tgt_vol,
+            "target_total_after_l": new_tgt_vol})
+
+        src["volume_l"] = new_src_vol
+        src.setdefault("transfers_out", []).append({
+            "batch_id": batch_id,
+            "event_id": event_id,
+            "ts": ts,
+            "to_container": tgt_id,
+            "volume_l": round(tvol, 6),
+            "operator": operator,
+            "reason": payload.get("reason"),
+            "reversal_of": reversal_of,
+            "source_volume_before_l": src_vol,
+            "source_volume_after_l": new_src_vol})
+        tgt["volume_l"] = new_tgt_vol
+        tgt["components"] = new_comps
+        tgt["transfer_batches"] = batches
+
+    @staticmethod
+    def _validate_sample(sample: Any, src_comps: List[Dict[str, Any]],
+                         src_id: str, tgt_id: str, batch_id: str):
+        """校验本次取样成分范围，返回 (规范化取样成分, 与源桶的交集)。
+
+        取样须覆盖源桶全部成分（否则转移成分不守恒，数量不闭合），
+        且每个成分的取样范围须与源桶冻结范围有交集。
+        """
+        if not isinstance(sample, list) or not sample:
+            raise StoreError("TRANSFER_INVALID",
+                             "sample_components 必须是非空列表", 422)
+        src_by_name = {engine._norm_comp_name(c.get("name")): c
+                       for c in src_comps}
+        norm_sample: List[Dict[str, Any]] = []
+        intersection: Dict[str, List[float]] = {}
+        seen = set()
+        for item in sample:
+            if not isinstance(item, dict) or "name" not in item \
+                    or "conc_min" not in item or "conc_max" not in item:
+                raise StoreError("TRANSFER_INVALID",
+                                 "取样成分项需含 name/conc_min/conc_max", 422)
+            try:
+                lo = float(item["conc_min"])
+                hi = float(item["conc_max"])
+            except (TypeError, ValueError):
+                raise StoreError(
+                    "TRANSFER_INVALID",
+                    f"取样成分 {item.get('name')} 浓度非数值", 422)
+            if lo < 0 or hi < 0 or lo > hi:
+                raise StoreError(
+                    "TRANSFER_INVALID",
+                    f"取样成分 {item.get('name')} 浓度范围非法 [{lo},{hi}]",
+                    422)
+            name_n = engine._norm_comp_name(item["name"])
+            src_comp = src_by_name.get(name_n)
+            if src_comp is None:
+                raise StoreError(
+                    "TRANSFER_SAMPLE_NO_INTERSECT",
+                    f"取样成分 {item['name']} 不在源桶 {src_id} 的冻结成分中，"
+                    "没有交集", 409,
+                    {"source_id": src_id, "target_id": tgt_id,
+                     "batch_id": batch_id,
+                     "component": item["name"],
+                     "source_components": [c.get("name") for c in src_comps],
+                     "basis": "取样成分须来自源桶冻结成分集合"})
+            s_lo = float(src_comp["conc_min"])
+            s_hi = float(src_comp["conc_max"])
+            if hi < s_lo - engine.EPS or lo > s_hi + engine.EPS:
+                raise StoreError(
+                    "TRANSFER_SAMPLE_NO_INTERSECT",
+                    f"取样范围 [{lo},{hi}] 与源桶 {src_id} 冻结范围 "
+                    f"[{s_lo},{s_hi}] 没有交集", 409,
+                    {"source_id": src_id, "target_id": tgt_id,
+                     "batch_id": batch_id,
+                     "component": item["name"],
+                     "sample_range": [lo, hi],
+                     "source_range": [s_lo, s_hi],
+                     "basis": "取样成分范围须与源桶冻结成分区间有交集"})
+            seen.add(name_n)
+            intersection[name_n] = [round(max(lo, s_lo), 6),
+                                    round(min(hi, s_hi), 6)]
+            norm_sample.append({"name": item["name"],
+                                "conc_min": lo, "conc_max": hi})
+        missing = [c.get("name") for c in src_comps
+                   if engine._norm_comp_name(c.get("name")) not in seen]
+        if missing:
+            raise StoreError(
+                "TRANSFER_NOT_BALANCED",
+                f"取样未覆盖源桶全部成分 {missing}，转移成分无法闭合", 409,
+                {"source_id": src_id, "target_id": tgt_id,
+                 "batch_id": batch_id,
+                 "missing_components": missing,
+                 "source_components": [c.get("name") for c in src_comps],
+                 "basis": "转入液成分集合须与源桶一致，否则目标桶混合成分"
+                          "无法按体积守恒计算"})
+        return norm_sample, intersection
+
+    def _validate_reversal(self, reversal_of: str, src_id: str,
+                           tgt_id: str, tvol: float):
+        """反向/补偿更正：被引用事件须为已落库的转移，且方向相反。"""
+        row = self.conn.execute(
+            "SELECT type, payload FROM events WHERE event_id=?",
+            (reversal_of,)).fetchone()
+        if row is None:
+            raise StoreError(
+                "TRANSFER_REVERSAL_INVALID",
+                f"被更正的转移事件 {reversal_of} 不存在", 404,
+                {"reversal_of": reversal_of})
+        if row["type"] != "transfer":
+            raise StoreError(
+                "TRANSFER_REVERSAL_INVALID",
+                f"事件 {reversal_of} 类型为 {row['type']}，"
+                "不是转移事件，不能作为反向/补偿更正依据", 422,
+                {"reversal_of": reversal_of, "referenced_type": row["type"]})
+        orig = json.loads(row["payload"])
+        if not (orig.get("source_id") == tgt_id
+                and orig.get("target_id") == src_id):
+            raise StoreError(
+                "TRANSFER_REVERSAL_INVALID",
+                "反向/补偿转移须与原转移方向相反（原 "
+                f"{orig.get('source_id')}→{orig.get('target_id')}）", 422,
+                {"reversal_of": reversal_of,
+                 "original": {"source_id": orig.get("source_id"),
+                              "target_id": orig.get("target_id"),
+                              "volume_l": orig.get("volume_l")},
+                 "this": {"source_id": src_id, "target_id": tgt_id,
+                          "volume_l": tvol},
+                 "basis": "更正以追加反向/补偿事件完成，历史转移不得改写"})
 
     @staticmethod
     def _merge_provenance(source_ids: List[str],
@@ -560,7 +894,8 @@ class Store:
         for row in rows:
             payload = json.loads(row["payload"])
             state = self._apply_event(
-                row["type"], row["container_id"], payload, state)
+                row["type"], row["container_id"], payload, state,
+                ts=row["ts"], event_id=row["event_id"])
         # 清掉内部标记不影响：state 即计算输入
         return state
 

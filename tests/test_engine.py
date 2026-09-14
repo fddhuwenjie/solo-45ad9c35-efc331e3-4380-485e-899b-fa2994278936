@@ -450,5 +450,395 @@ class MergeStorageTests(unittest.TestCase):
                          ["A1", "K1"])
 
 
+class TransferEngineTests(unittest.TestCase):
+    """部分转移：批次禁配自检、体积闭合与准入预检（引擎层）。"""
+
+    def setUp(self):
+        self.m = M.build_v1()
+        self.fac = facility()
+
+    @staticmethod
+    def _transferred_container(volume=25):
+        """20L 酸基线 + 5L 含氰转入批次的目标桶（绕过准入手工构造）。"""
+        return {
+            "id": "T1",
+            # 20L hcl[30,32] + 5L nacn[5,8] 体积加权后的混合成分
+            "components": [{"name": "hcl", "conc_min": 24.0,
+                            "conc_max": 25.6},
+                           {"name": "nacn", "conc_min": 1.0,
+                            "conc_max": 1.6}],
+            "hazard_classes": ["acid"],
+            "material": "hdpe", "capacity_l": 40, "volume_l": volume,
+            "position": {"cabinet_id": "CAB-A", "zone_id": "Z-acid",
+                         "tray_id": "T-a2"},
+            "transfer_batches": [
+                {"batch_id": "b_base_T1", "kind": "base", "event_id": None,
+                 "ts": None, "from_container": None, "to_container": "T1",
+                 "volume_l": 20,
+                 "components": [{"name": "hcl", "conc_min": 30,
+                                 "conc_max": 32}],
+                 "operator": None, "reason": "入库原始成分",
+                 "source_batch_ids": []},
+                {"batch_id": "b_1", "kind": "transfer_in",
+                 "event_id": "evt_1", "ts": "2026-09-14T10:00:00Z",
+                 "from_container": "K1", "to_container": "T1",
+                 "volume_l": 5,
+                 "components": [{"name": "nacn", "conc_min": 5,
+                                 "conc_max": 8}],
+                 "operator": "王工", "reason": "误操作",
+                 "source_batch_ids": []},
+            ],
+        }
+
+    def test_transfer_batch_incompatible_flagged(self):
+        # 桶内批次禁配：酸基线批次 × 含氰转入批次 -> R1/HCN，依据含批次号
+        res = engine.evaluate_layout(self.m, self.fac,
+                                     [self._transferred_container()])
+        self.assertEqual(res["disposition"], "pending")
+        iss = [i for i in res["issues"]
+               if i["code"] == "TRANSFER_BATCH_INCOMPATIBLE"]
+        self.assertEqual(len(iss), 1)
+        self.assertEqual(iss[0]["basis"]["rule_id"], "R1")
+        self.assertEqual(iss[0]["basis"]["rule"]["gas"], "HCN")
+        self.assertEqual(iss[0]["basis"]["batch_pair"], ["b_base_T1", "b_1"])
+        self.assertEqual(iss[0]["containers"], ["T1"])
+        # 计算明细 transfers 段同样可追溯
+        td = res["calculation"]["transfers"][0]
+        self.assertEqual(td["container"], "T1")
+        self.assertEqual(td["pair_checks"][0]["matched_rules"][0]["rule_id"],
+                         "R1")
+        self.assertTrue(td["volume_closure"]["closed"])
+
+    def test_transfer_volume_closure(self):
+        # 闭合：基线 20 + 转入 5 - 转出 0 = 25；篡改为 26 则不闭合
+        ok = self._transferred_container(volume=25)
+        res = engine.evaluate_layout(self.m, self.fac, [ok])
+        self.assertNotIn("TRANSFER_VOLUME_MISMATCH",
+                         {i["code"] for i in res["issues"]})
+        bad = self._transferred_container(volume=26)
+        res = engine.evaluate_layout(self.m, self.fac, [bad])
+        iss = next(i for i in res["issues"]
+                   if i["code"] == "TRANSFER_VOLUME_MISMATCH")
+        self.assertEqual(iss["basis"]["expected_l"], 25)
+        self.assertEqual(iss["basis"]["actual_l"], 26)
+
+    def test_transfer_conflicts_precheck(self):
+        # 准入预检：含氰转入液 vs 酸基线批次 -> R1；同类酸 -> 无冲突
+        target = self._transferred_container()
+        conflicts = engine.transfer_conflicts(
+            self.m, [{"name": "nacn", "conc_min": 5, "conc_max": 8}],
+            {"id": "X", "components": [{"name": "hcl", "conc_min": 30,
+                                        "conc_max": 32}]})
+        self.assertEqual(conflicts[0]["against_batch_id"], "(当前成分)")
+        self.assertEqual(conflicts[0]["matched_rules"][0]["rule_id"], "R1")
+        ok = engine.transfer_conflicts(
+            self.m, [{"name": "hcl", "conc_min": 20, "conc_max": 25}],
+            {"id": "X", "components": [{"name": "hcl", "conc_min": 30,
+                                        "conc_max": 32}]})
+        self.assertEqual(ok, [])
+        # 目标桶有批次链时逐批核对，命中给出批次号
+        by_batch = engine.transfer_conflicts(
+            self.m, [{"name": "nacn", "conc_min": 5, "conc_max": 8}],
+            target)
+        self.assertEqual(by_batch[0]["against_batch_id"], "b_base_T1")
+
+    def test_transfer_conflicts_possible_from_range(self):
+        # 浓度范围跨阈值 -> 可能禁配同样命中（从严）
+        conflicts = engine.transfer_conflicts(
+            self.m, [{"name": "nacn", "conc_min": 0.5, "conc_max": 2.0}],
+            {"id": "X", "components": [{"name": "hcl", "conc_min": 30,
+                                        "conc_max": 32}]})
+        self.assertEqual(conflicts[0]["matched_rules"], [])
+        self.assertEqual(conflicts[0]["possible_rules"][0]["rule_id"], "R1")
+
+
+class TransferStorageTests(unittest.TestCase):
+    """部分转移事件在存储层的应用、校验与回放。"""
+
+    def setUp(self):
+        self.store = Store(":memory:")
+        self.store.put_facility("F1", facility())
+        self.m = self.store.load_matrix("1.0")
+
+    def _intake(self, c, state=None):
+        state = self.store.replay_state("F1") if state is None else state
+        return self.store._apply_event(
+            "intake", c["id"], {"container": c}, state)
+
+    def _two_acid_state(self):
+        a2 = acid(cid="A2", tray="T-a2", vol=5)
+        state = self._intake(acid())
+        return self._intake(a2, state)
+
+    def _transfer_payload(self, **kw):
+        p = {"source_id": "A1", "target_id": "A2", "volume_l": 5,
+             "operator": "王工", "reason": "分次过桶", "batch_id": "b_t1"}
+        p.update(kw)
+        return p
+
+    def test_happy_path_volume_conservation_and_batches(self):
+        state = self._two_acid_state()
+        state = self.store._apply_event(
+            "transfer", "A1", self._transfer_payload(
+                sample_components=[{"name": "hcl", "conc_min": 29,
+                                    "conc_max": 31}]),
+            state, matrix=self.m, ts="2026-09-14T10:00:00Z",
+            event_id="evt_t1")
+        # 体积守恒：20-5=15，5+5=10
+        self.assertEqual(state["A1"]["volume_l"], 15)
+        self.assertEqual(state["A2"]["volume_l"], 10)
+        # 目标桶成分按体积加权（取样 [29,31] 与现存 [30,32] 各 5L）
+        comps = {c["name"]: c for c in state["A2"]["components"]}
+        self.assertAlmostEqual(comps["hcl"]["conc_min"], 29.5)
+        self.assertAlmostEqual(comps["hcl"]["conc_max"], 31.5)
+        # 批次链：基线批次 + 转入批次，含操作者/理由/前后数量
+        batches = state["A2"]["transfer_batches"]
+        self.assertEqual([b["batch_id"] for b in batches],
+                         ["b_base_A2", "b_t1"])
+        self.assertEqual(batches[0]["kind"], "base")
+        self.assertEqual(batches[0]["volume_l"], 5)
+        t_in = batches[1]
+        self.assertEqual(t_in["from_container"], "A1")
+        self.assertEqual(t_in["operator"], "王工")
+        self.assertEqual(t_in["reason"], "分次过桶")
+        self.assertEqual(t_in["event_id"], "evt_t1")
+        self.assertEqual(t_in["ts"], "2026-09-14T10:00:00Z")
+        self.assertEqual(t_in["composition_basis"], "sample")
+        self.assertEqual(t_in["sample_source_intersection"]["hcl"],
+                         [30, 31])
+        self.assertEqual(t_in["source_volume_before_l"], 20)
+        self.assertEqual(t_in["source_volume_after_l"], 15)
+        self.assertEqual(t_in["target_total_after_l"], 10)
+        # 源桶转出记录
+        out = state["A1"]["transfers_out"][0]
+        self.assertEqual(out["to_container"], "A2")
+        self.assertEqual(out["volume_l"], 5)
+        self.assertEqual(out["operator"], "王工")
+        # 源桶成分不因抽取而改变
+        self.assertEqual(state["A1"]["components"][0]["conc_min"], 30)
+
+    def test_same_container_rejected(self):
+        state = self._two_acid_state()
+        with self.assertRaises(StoreError) as ctx:
+            self.store._apply_event(
+                "transfer", "A1",
+                self._transfer_payload(target_id="A1"), state,
+                matrix=self.m)
+        self.assertEqual(ctx.exception.code, "TRANSFER_SAME_CONTAINER")
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(state["A1"]["volume_l"], 20)
+
+    def test_exceeds_source_rejected_with_basis(self):
+        state = self._two_acid_state()
+        with self.assertRaises(StoreError) as ctx:
+            self.store._apply_event(
+                "transfer", "A1", self._transfer_payload(volume_l=25),
+                state, matrix=self.m)
+        err = ctx.exception
+        self.assertEqual(err.code, "TRANSFER_EXCEEDS_SOURCE")
+        self.assertEqual(err.status, 409)
+        self.assertEqual(err.detail["source_volume_l"], 20)
+        self.assertEqual(err.detail["requested_l"], 25)
+        self.assertEqual(err.detail["deficit_l"], 5)
+        self.assertEqual(err.detail["batch_id"], "b_t1")
+        self.assertEqual(state["A1"]["volume_l"], 20)
+        self.assertNotIn("transfer_batches", state["A2"])
+
+    def test_operator_required(self):
+        state = self._two_acid_state()
+        with self.assertRaises(StoreError) as ctx:
+            self.store._apply_event(
+                "transfer", "A1", self._transfer_payload(operator="  "),
+                state, matrix=self.m)
+        self.assertEqual(ctx.exception.code, "TRANSFER_INVALID")
+
+    def test_sample_no_intersect_rejected(self):
+        state = self._two_acid_state()
+        # 范围无交集
+        with self.assertRaises(StoreError) as ctx:
+            self.store._apply_event(
+                "transfer", "A1",
+                self._transfer_payload(sample_components=[
+                    {"name": "hcl", "conc_min": 10, "conc_max": 20}]),
+                state, matrix=self.m)
+        err = ctx.exception
+        self.assertEqual(err.code, "TRANSFER_SAMPLE_NO_INTERSECT")
+        self.assertEqual(err.detail["source_range"], [30, 32])
+        self.assertEqual(err.detail["sample_range"], [10, 20])
+        # 成分不在源桶冻结成分中
+        with self.assertRaises(StoreError) as ctx2:
+            self.store._apply_event(
+                "transfer", "A1",
+                self._transfer_payload(sample_components=[
+                    {"name": "naoh", "conc_min": 10, "conc_max": 20}]),
+                state, matrix=self.m)
+        self.assertEqual(ctx2.exception.code, "TRANSFER_SAMPLE_NO_INTERSECT")
+        self.assertEqual(state["A1"]["volume_l"], 20)
+
+    def test_sample_must_cover_all_source_components(self):
+        # 源桶含两个成分，取样只报一个 -> 数量不闭合
+        multi = acid(cid="M9", tray="T-a2")
+        multi["components"] = [
+            {"name": "hcl", "conc_min": 30, "conc_max": 32},
+            {"name": "acetic_acid", "conc_min": 5, "conc_max": 8}]
+        state = self._intake(acid())
+        state = self._intake(multi, state)
+        with self.assertRaises(StoreError) as ctx:
+            self.store._apply_event(
+                "transfer", "M9",
+                {"source_id": "M9", "target_id": "A1", "volume_l": 5,
+                 "operator": "王工", "batch_id": "b_x",
+                 "sample_components": [
+                     {"name": "hcl", "conc_min": 30, "conc_max": 32}]},
+                state, matrix=self.m)
+        err = ctx.exception
+        self.assertEqual(err.code, "TRANSFER_NOT_BALANCED")
+        self.assertEqual(err.detail["missing_components"], ["acetic_acid"])
+
+    def test_declared_expectation_mismatch_rejected(self):
+        state = self._two_acid_state()
+        with self.assertRaises(StoreError) as ctx:
+            self.store._apply_event(
+                "transfer", "A1",
+                self._transfer_payload(
+                    expect={"source_remaining_l": 14,
+                            "target_total_l": 10}),
+                state, matrix=self.m)
+        err = ctx.exception
+        self.assertEqual(err.code, "TRANSFER_NOT_BALANCED")
+        self.assertEqual(
+            err.detail["mismatches"]["source_remaining_l"]["computed"], 15)
+        # 声明与计算一致时放行
+        state = self.store._apply_event(
+            "transfer", "A1",
+            self._transfer_payload(
+                expect={"source_remaining_l": 15, "target_total_l": 10}),
+            state, matrix=self.m)
+        self.assertEqual(state["A1"]["volume_l"], 15)
+
+    def test_incompatible_transfer_rejected_state_unchanged(self):
+        state = self._intake(acid())
+        state = self._intake(cyanide(), state)
+        before = copy.deepcopy(state)
+        with self.assertRaises(StoreError) as ctx:
+            self.store._apply_event(
+                "transfer", "A1",
+                {"source_id": "A1", "target_id": "K1", "volume_l": 5,
+                 "operator": "王工", "batch_id": "b_bad"}, state,
+                matrix=self.m)
+        err = ctx.exception
+        self.assertEqual(err.code, "TRANSFER_INCOMPATIBLE")
+        self.assertEqual(err.status, 409)
+        self.assertIn("R1", err.detail["rules_hit"])
+        self.assertEqual(err.detail["source_id"], "A1")
+        self.assertEqual(err.detail["target_id"], "K1")
+        self.assertEqual(err.detail["batch_id"], "b_bad")
+        # 状态不变
+        self.assertEqual(json.dumps(state, sort_keys=True),
+                         json.dumps(before, sort_keys=True))
+
+    def test_chained_transfer_recursive_provenance(self):
+        # A1 -> B1 -> C1：C1 的批次记录 B1 当时的批次链，可递归上溯
+        b1 = acid(cid="B1", tray="T-a2", vol=5)
+        c1 = acid(cid="C1", tray="T-o1", zone="Z-other", vol=2)
+        state = self._intake(acid())
+        state = self._intake(b1, state)
+        state = self._intake(c1, state)
+        state = self.store._apply_event(
+            "transfer", "A1",
+            {"source_id": "A1", "target_id": "B1", "volume_l": 5,
+             "operator": "王工", "batch_id": "b_ab"},
+            state, matrix=self.m, ts="2026-09-14T10:00:00Z")
+        state = self.store._apply_event(
+            "transfer", "B1",
+            {"source_id": "B1", "target_id": "C1", "volume_l": 3,
+             "operator": "李工", "batch_id": "b_bc"},
+            state, matrix=self.m, ts="2026-09-14T11:00:00Z")
+        c1_batches = state["C1"]["transfer_batches"]
+        self.assertEqual([b["batch_id"] for b in c1_batches],
+                         ["b_base_C1", "b_bc"])
+        # 递归追溯：b_bc 记录了源桶 B1 当时的全部批次号
+        self.assertEqual(c1_batches[1]["source_batch_ids"],
+                         ["b_base_B1", "b_ab"])
+        # B1 体积闭合：基线 5 + 转入 5 - 转出 3 = 7
+        self.assertEqual(state["B1"]["volume_l"], 7)
+        res = engine.evaluate_layout(self.m, facility(),
+                                     [state[k] for k in sorted(state)])
+        td = {t["container"]: t
+              for t in res["calculation"]["transfers"]}
+        self.assertTrue(td["B1"]["volume_closure"]["closed"])
+        self.assertTrue(td["C1"]["volume_closure"]["closed"])
+
+    def test_reversal_validation(self):
+        # 先走全流程落库一条转移事件，供 reversal_of 引用
+        self.store.append_event(
+            {"type": "intake", "ts": "2026-09-14T09:00:00Z",
+             "container_id": "A1",
+             "payload": {"container": acid()}}, "F1", "1.0")
+        self.store.append_event(
+            {"type": "intake", "ts": "2026-09-14T09:05:00Z",
+             "container_id": "A2",
+             "payload": {"container": acid(cid="A2", tray="T-a2", vol=5)}},
+            "F1", "1.0")
+        self.store.append_event(
+            {"type": "transfer", "ts": "2026-09-14T10:00:00Z",
+             "event_id": "evt_t1",
+             "payload": {"source_id": "A1", "target_id": "A2",
+                         "volume_l": 5, "operator": "王工"}}, "F1", "1.0")
+        # 同方向引用 -> 拒绝
+        with self.assertRaises(StoreError) as ctx:
+            self.store.append_event(
+                {"type": "transfer", "ts": "2026-09-14T11:00:00Z",
+                 "payload": {"source_id": "A1", "target_id": "A2",
+                             "volume_l": 5, "operator": "王工",
+                             "reversal_of": "evt_t1"}}, "F1", "1.0")
+        self.assertEqual(ctx.exception.code, "TRANSFER_REVERSAL_INVALID")
+        # 引用不存在的事件 -> 404
+        with self.assertRaises(StoreError) as ctx2:
+            self.store.append_event(
+                {"type": "transfer", "ts": "2026-09-14T11:00:00Z",
+                 "payload": {"source_id": "A2", "target_id": "A1",
+                             "volume_l": 5, "operator": "王工",
+                             "reversal_of": "evt_ghost"}}, "F1", "1.0")
+        self.assertEqual(ctx2.exception.status, 404)
+        # 正确反向：A2 -> A1，数量恢复，批次记录 reversal_of
+        self.store.append_event(
+            {"type": "transfer", "ts": "2026-09-14T11:00:00Z",
+             "payload": {"source_id": "A2", "target_id": "A1",
+                         "volume_l": 5, "operator": "王工",
+                         "reason": "误转回退", "reversal_of": "evt_t1"}},
+            "F1", "1.0")
+        state = self.store.replay_state("F1")
+        self.assertEqual(state["A1"]["volume_l"], 20)
+        self.assertEqual(state["A2"]["volume_l"], 5)
+        a1_batches = state["A1"]["transfer_batches"]
+        self.assertEqual(a1_batches[-1]["reversal_of"], "evt_t1")
+        self.assertEqual(a1_batches[-1]["reason"], "误转回退")
+
+    def test_append_event_replay_batch_id_stable(self):
+        # 追加与回放产生完全一致的批次链（batch_id 注入 payload 后落库）
+        self.store.append_event(
+            {"type": "intake", "ts": "2026-09-14T09:00:00Z",
+             "container_id": "A1", "payload": {"container": acid()}},
+            "F1", "1.0")
+        self.store.append_event(
+            {"type": "intake", "ts": "2026-09-14T09:05:00Z",
+             "container_id": "A2",
+             "payload": {"container": acid(cid="A2", tray="T-a2", vol=5)}},
+            "F1", "1.0")
+        rev = self.store.append_event(
+            {"type": "transfer", "ts": "2026-09-14T10:00:00Z",
+             "payload": {"source_id": "A1", "target_id": "A2",
+                         "volume_l": 5, "operator": "王工"}}, "F1", "1.0")
+        replayed = self.store.replay_state("F1")
+        stored = self.store.get_revision(rev["revision_id"])["state"]
+        self.assertEqual(json.dumps(replayed, sort_keys=True),
+                         json.dumps(stored, sort_keys=True))
+        ev = [e for e in self.store.list_events("F1")
+              if e["type"] == "transfer"][0]
+        self.assertEqual(ev["payload"]["batch_id"],
+                         stored["A2"]["transfer_batches"][1]["batch_id"])
+
+
 if __name__ == "__main__":
     unittest.main()

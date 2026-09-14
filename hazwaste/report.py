@@ -86,6 +86,13 @@ def build_disposal_sheet(rev: Dict[str, Any],
             merge_check = {k: v for k, v in m.items() if k != "_issues"}
             break
 
+    # ---- 部分转移批次自检明细（批次两两禁配 + 体积闭合） ----
+    transfer_check = None
+    for t in calc.get("transfers", []):
+        if t["container"] == container_id:
+            transfer_check = {k: v for k, v in t.items() if k != "_issues"}
+            break
+
     # ---- 本桶相关问题（含阻断与警告），给出依据与整改建议 ----
     my_issues = [i for i in result["issues"]
                  if container_id in i["containers"]]
@@ -115,6 +122,10 @@ def build_disposal_sheet(rev: Dict[str, Any],
             "merged_from": c.get("merged_from"),
             "merge_provenance": c.get("merge_provenance"),
             "replaced_from": c.get("replaced_from"),
+            # 部分转移的批次链与转出记录（含时刻、操作者、人工理由），
+            # 处置单据此可还原每次转移
+            "transfer_batches": c.get("transfer_batches"),
+            "transfers_out": c.get("transfers_out"),
         },
         "classification_detail": {
             "definite": cls["definite"],
@@ -128,6 +139,7 @@ def build_disposal_sheet(rev: Dict[str, Any],
         "fill_check": fill_detail,
         "pair_checks": pairs,
         "merge_self_check": merge_check,
+        "transfer_batch_check": transfer_check,
         "tray_containment_check": tray,
         "issues": [{
             "code": i["code"],
@@ -180,6 +192,17 @@ def _remediations(issue: Dict[str, Any], cid: str) -> List[str]:
         return [f"禁止该合并：源桶 {src} 在桶内混合会触发规则 "
                 f"{rule.get('id')}（{rule.get('note', '')}）；"
                 "应分桶分柜存放，不得并入同一容器"]
+    if code in ("TRANSFER_BATCH_INCOMPATIBLE",
+                "TRANSFER_BATCH_POSSIBLY_INCOMPATIBLE"):
+        pair = issue.get("basis", {}).get("batch_pair", [])
+        return [f"桶内转移批次 {pair} 命中禁配规则 "
+                f"{rule.get('id')}（{rule.get('note', '')}）；"
+                "此类转移在准入时即应被拒绝，请核查矩阵版本是否升级或成分"
+                "是否被更正，并通过追加反向/补偿转移事件纠正"
+                "（历史事件不得改写）"]
+    if code == "TRANSFER_VOLUME_MISMATCH":
+        return ["批次体积推算与当前装量不闭合：核对事件日志与批次记录，"
+              "追加补偿转移事件使数量闭合（禁止改写历史事件）"]
     if code == "TRAY_CONTAINMENT_INSUFFICIENT":
         d = issue["basis"].get("deficit_l")
         return [f"更换更大托盘或分装，盛漏有效容积至少增加 {d}L"

@@ -13,12 +13,13 @@
     # 设施（柜体/分区/托盘/通风），版本化
     PUT  /facilities/{fid}
     GET  /facilities/{fid}?version=
-    # 事件（入库/移位/合并/成分更正/换桶），每次产生不可改写的新修订
+    # 事件（入库/移位/合并/部分转移/成分更正/换桶），每次产生不可改写的新修订
     POST /facilities/{fid}/events
     GET  /events
     # 布局复核
-    POST /facilities/{fid}/layout/try         试排（不落事件，结果冻结）
-    POST /facilities/{fid}/layout/move-check  移动预检（不落事件，结果冻结）
+    POST /facilities/{fid}/layout/try             试排（不落事件，结果冻结）
+    POST /facilities/{fid}/layout/move-check      移动预检（不落事件，结果冻结）
+    POST /facilities/{fid}/layout/transfer-check  部分转移预检（不落事件，结果冻结）
     # 修订
     GET  /revisions
     GET  /revisions/latest
@@ -41,7 +42,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import engine
 from .report import build_disposal_sheet
-from .storage import Store, StoreError
+from .storage import Store, StoreError, new_id
 
 
 class Api:
@@ -177,6 +178,50 @@ class Api:
         view["move_verdict"] = self._move_verdict(base, saved)
         return view
 
+    def transfer_check(self, fid, body, q):
+        """部分转移预检：不落事件地套用一次 transfer 并冻结试算快照。
+
+        准入类错误（同源同桶/超量/不闭合/取样无交集/混入禁配物）与正式
+        事件返回完全相同的 4xx 与计算依据；通过准入但引入布局阻断项时
+        返回 201 且 transfer_verdict.allowed=false。
+        """
+        facility = self.store.get_facility(fid)
+        matrix = self.resolve_matrix(body)
+        tr = body.get("transfer")
+        if not isinstance(tr, dict):
+            raise StoreError(
+                "TRANSFER_CHECK_INVALID",
+                "需要 transfer 对象（source_id/target_id/volume_l/operator，"
+                "可选 sample_components/expect/reason/reversal_of）", 422)
+        payload = copy.deepcopy(tr)
+        payload.setdefault("batch_id", new_id("b_precheck"))
+        state = self.store.replay_state(fid)
+        new_state = self.store._apply_event(
+            "transfer", tr.get("source_id"), payload, state,
+            matrix=matrix, ts=tr.get("ts"), event_id=None)
+        base = self.store.latest_revision(fid)
+        saved = self.store.save_trial(
+            "transfer_check", {"transfer": payload}, facility, matrix,
+            new_state, base["revision_id"] if base else None)
+        view = self._trial_view(saved, base)
+        src_id, tgt_id = tr.get("source_id"), tr.get("target_id")
+        # 预检同时返回转移前后的数量与成分依据，便于核对后再正式落事件
+        view["transfer"] = {
+            "source_id": src_id,
+            "target_id": tgt_id,
+            "volume_l": payload.get("volume_l"),
+            "operator": payload.get("operator"),
+            "reason": payload.get("reason"),
+            "batch_id": payload["batch_id"],
+            "composition_basis": new_state[tgt_id]["transfer_batches"]
+                [-1]["composition_basis"],
+            "source_remaining_l": new_state[src_id]["volume_l"],
+            "target_total_l": new_state[tgt_id]["volume_l"],
+            "target_components": new_state[tgt_id]["components"],
+        }
+        view["transfer_verdict"] = self._transfer_verdict(base, saved)
+        return view
+
     @staticmethod
     def _move_verdict(base: Optional[Dict[str, Any]],
                       trial: Dict[str, Any]) -> Dict[str, Any]:
@@ -201,6 +246,33 @@ class Api:
                     "issues_resolved": cmp["issues_resolved"]}
         return {"allowed": False,
                 "reason": "移动未引入新问题，但布局中仍存在阻断项",
+                "issues_persisted": cmp["issues_persisted"]}
+
+    @staticmethod
+    def _transfer_verdict(base: Optional[Dict[str, Any]],
+                          trial: Dict[str, Any]) -> Dict[str, Any]:
+        """转移预检结论：转移是否引入/消除阻断项（准入校验已在之前完成）。"""
+        result = trial["result"]
+        blockers = [i for i in result["issues"] if i["blocking"]]
+        if base is None:
+            return {"allowed": not blockers,
+                    "reason": ("当前无历史修订，按试算结果判定"
+                               if not blockers else "存在阻断项")}
+        cmp = engine.diff_results(base["result"], result)
+        introduced = cmp["issues_introduced"]
+        if introduced:
+            return {
+                "allowed": False,
+                "reason": "转移将引入禁配/盛漏/装填等阻断问题",
+                "issues_introduced": introduced,
+                "issues_resolved": cmp["issues_resolved"],
+            }
+        if not blockers:
+            return {"allowed": True,
+                    "reason": "转移后全部核查通过",
+                    "issues_resolved": cmp["issues_resolved"]}
+        return {"allowed": False,
+                "reason": "转移未引入新问题，但布局中仍存在阻断项",
                 "issues_persisted": cmp["issues_persisted"]}
 
     def _trial_view(self, saved: Dict[str, Any],
@@ -319,6 +391,7 @@ ROUTES = [
     ("POST",   r"/facilities/{fid}/events",                 "post_event"),
     ("POST",   r"/facilities/{fid}/layout/try",             "trial"),
     ("POST",   r"/facilities/{fid}/layout/move-check",      "move_check"),
+    ("POST",   r"/facilities/{fid}/layout/transfer-check",  "transfer_check"),
     ("GET",    "/revisions",                                "list_revisions"),
     ("GET",    "/revisions/latest",                         "latest_revision"),
     ("POST",   r"/revisions/{rid}/confirm",                 "confirm_revision"),
@@ -404,7 +477,7 @@ class Handler(BaseHTTPRequestHandler):
             out = fn(**kwargs)
             status = 201 if method == "POST" and name in (
                 "post_event", "freeze_matrix", "trial", "move_check",
-                "confirm_revision") else 200
+                "transfer_check", "confirm_revision") else 200
             self._send_json(out, status)
         except StoreError as exc:
             self._send_json({"error": {"code": exc.code,

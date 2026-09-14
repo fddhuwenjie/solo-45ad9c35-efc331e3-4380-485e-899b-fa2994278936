@@ -517,6 +517,302 @@ class ApiTests(unittest.TestCase):
                  if i["code"] == "INCOMPATIBLE_COLOCATION"}
         self.assertIn("R6", rules)
 
+    # ------------------------------------------------------------------ #
+    # 部分转移（过桶）
+    # ------------------------------------------------------------------ #
+    def _intake_a2(self, vol=5, ts="2026-09-14T09:05:00Z", capacity=25):
+        a2 = json.loads(json.dumps(ACID))
+        a2["id"] = "A2"
+        a2["volume_l"] = vol
+        a2["capacity_l"] = capacity
+        a2["position"] = {"cabinet_id": "CAB-A", "zone_id": "Z-acid",
+                          "tray_id": "T-a2"}
+        return self._intake(a2, ts, event_id=f"e-{a2['id']}-{vol}")
+
+    def _transfer(self, payload, ts="2026-09-14T10:00:00Z",
+                  event_id=None):
+        ev = {"ts": ts, "type": "transfer", "payload": payload}
+        if event_id:
+            ev["event_id"] = event_id
+        return self.api.post(f"/facilities/{self.fid}/events",
+                             {"matrix_version": "1.0", "event": ev})
+
+    def test_17_transfer_precheck_event_and_audit_trail(self):
+        self._intake(ACID, "2026-09-14T09:00:00Z", event_id="e-acid")
+        self._intake_a2()
+
+        # 预检：不落事件，返回转移前后数量与成分依据
+        st, pc = self.api.post(
+            f"/facilities/{self.fid}/layout/transfer-check",
+            {"matrix_version": "1.0", "transfer": {
+                "source_id": "A1", "target_id": "A2", "volume_l": 5,
+                "operator": "王工", "reason": "分次过桶",
+                "sample_components": [{"name": "hcl", "conc_min": 29,
+                                       "conc_max": 31}],
+                "ts": "2026-09-14T10:00:00Z"}})
+        self.assertEqual(st, 201, pc)
+        self.assertTrue(pc["transfer_verdict"]["allowed"], pc)
+        self.assertEqual(pc["transfer"]["source_remaining_l"], 15)
+        self.assertEqual(pc["transfer"]["target_total_l"], 10)
+        self.assertEqual(pc["transfer"]["composition_basis"], "sample")
+        self.assertTrue(pc["transfer"]["batch_id"])
+        self.assertTrue(pc["frozen"])
+        st, ev = self.api.get(f"/events?facility_id={self.fid}")
+        self.assertEqual(len(ev["events"]), 2)  # 预检不落事件
+        # 预检快照可取回，且含操作者与人工理由
+        st, snap = self.api.get(f"/trials/{pc['trial_id']}")
+        self.assertEqual(st, 200)
+        self.assertEqual(snap["proposal"]["transfer"]["operator"], "王工")
+        self.assertEqual(snap["proposal"]["transfer"]["reason"], "分次过桶")
+
+        # 正式转移事件 -> 新修订（kind=transfer）
+        st, resp = self._transfer({
+            "source_id": "A1", "target_id": "A2", "volume_l": 5,
+            "operator": "王工", "reason": "分次过桶",
+            "sample_components": [{"name": "hcl", "conc_min": 29,
+                                   "conc_max": 31}],
+            "expect": {"source_remaining_l": 15, "target_total_l": 10}})
+        self.assertEqual(st, 201, resp)
+        self.assertEqual(resp["latest"], "disposable")
+        self.assertEqual(resp["revisions"][0]["kind"], "transfer")
+        rev_id = resp["revisions"][0]["revision_id"]
+
+        st, rev = self.api.get(f"/revisions/{rev_id}")
+        self.assertEqual(rev["state"]["A1"]["volume_l"], 15)
+        self.assertEqual(rev["state"]["A2"]["volume_l"], 10)
+        comps = {c["name"]: c for c in rev["state"]["A2"]["components"]}
+        self.assertAlmostEqual(comps["hcl"]["conc_min"], 29.5)
+        self.assertAlmostEqual(comps["hcl"]["conc_max"], 31.5)
+        # 批次链：基线 + 转入，含操作者/人工理由/前后数量
+        batches = rev["state"]["A2"]["transfer_batches"]
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(batches[0]["kind"], "base")
+        self.assertEqual(batches[1]["operator"], "王工")
+        self.assertEqual(batches[1]["reason"], "分次过桶")
+        self.assertEqual(batches[1]["from_container"], "A1")
+        self.assertEqual(batches[1]["source_volume_before_l"], 20)
+        self.assertEqual(batches[1]["source_volume_after_l"], 15)
+        self.assertEqual(batches[1]["sample_source_intersection"]["hcl"],
+                         [30, 31])
+        self.assertEqual(
+            rev["state"]["A1"]["transfers_out"][0]["to_container"], "A2")
+        # 事件日志可还原本次转移及人工理由
+        st, ev = self.api.get(f"/events?facility_id={self.fid}")
+        tr_ev = [e for e in ev["events"] if e["type"] == "transfer"][0]
+        self.assertEqual(tr_ev["payload"]["operator"], "王工")
+        self.assertEqual(tr_ev["payload"]["reason"], "分次过桶")
+        self.assertTrue(tr_ev["payload"]["batch_id"])
+        # 逐桶处置单：批次链 + 批次自检 + 体积闭合
+        st, sh = self.api.get(
+            f"/revisions/{rev_id}/disposal?container_id=A2")
+        self.assertEqual(st, 200, sh)
+        self.assertEqual(len(sh["container"]["transfer_batches"]), 2)
+        self.assertEqual(sh["container"]["transfer_batches"][1]["operator"],
+                         "王工")
+        self.assertTrue(
+            sh["transfer_batch_check"]["volume_closure"]["closed"])
+        # 复算 JSON：指纹一致，输入含批次链
+        st, rc = self.api.post(f"/revisions/{rev_id}/recalc", {})
+        self.assertTrue(rc["verified"])
+        a2_in = next(c for c in rc["inputs"]["containers"]
+                     if c["id"] == "A2")
+        self.assertEqual(len(a2_in["transfer_batches"]), 2)
+        # 版本差异：无需翻事件日志即可还原本次转移与人工理由
+        prev = rev["parent_revision_id"]
+        st, d = self.api.get(f"/revisions/{prev}/diff/{rev_id}")
+        act = [a for a in d["transfer_activity"]
+               if a["container_id"] == "A2"]
+        self.assertTrue(act, d)
+        added = act[0]["added_batches"]
+        self.assertTrue(any(
+            b["operator"] == "王工" and b["reason"] == "分次过桶"
+            and b["from_container"] == "A1" and b["volume_l"] == 5
+            for b in added), added)
+
+    def test_18_transfer_rejections_keep_state(self):
+        self._intake(ACID, "2026-09-14T09:00:00Z")
+        self._intake_a2()
+        st, before = self.api.get(f"/revisions?facility_id={self.fid}")
+        n_before = len(before["revisions"])
+
+        # 源桶与目标桶相同
+        st, err = self._transfer({"source_id": "A1", "target_id": "A1",
+                                  "volume_l": 5, "operator": "王工"})
+        self.assertEqual(st, 422)
+        self.assertEqual(err["error"]["code"], "TRANSFER_SAME_CONTAINER")
+        self.assertEqual(err["error"]["detail"]["source_id"], "A1")
+        # 转移超量
+        st, err = self._transfer({"source_id": "A1", "target_id": "A2",
+                                  "volume_l": 25, "operator": "王工"})
+        self.assertEqual(st, 409)
+        self.assertEqual(err["error"]["code"], "TRANSFER_EXCEEDS_SOURCE")
+        d = err["error"]["detail"]
+        self.assertEqual(d["source_volume_l"], 20)
+        self.assertEqual(d["requested_l"], 25)
+        self.assertEqual(d["deficit_l"], 5)
+        self.assertTrue(d["batch_id"])
+        # 取样结果与源桶冻结成分没有交集
+        st, err = self._transfer({
+            "source_id": "A1", "target_id": "A2", "volume_l": 5,
+            "operator": "王工",
+            "sample_components": [{"name": "hcl", "conc_min": 10,
+                                   "conc_max": 20}]})
+        self.assertEqual(st, 409)
+        self.assertEqual(err["error"]["code"],
+                         "TRANSFER_SAMPLE_NO_INTERSECT")
+        self.assertEqual(err["error"]["detail"]["source_range"], [30, 32])
+        self.assertEqual(err["error"]["detail"]["sample_range"], [10, 20])
+        # 数量不闭合（声明的转移后数量与体积守恒不符）
+        st, err = self._transfer({
+            "source_id": "A1", "target_id": "A2", "volume_l": 5,
+            "operator": "王工", "expect": {"source_remaining_l": 14}})
+        self.assertEqual(st, 409)
+        self.assertEqual(err["error"]["code"], "TRANSFER_NOT_BALANCED")
+        self.assertIn("source_remaining_l",
+                      err["error"]["detail"]["mismatches"])
+        # 事件倒序
+        st, err = self._transfer(
+            {"source_id": "A1", "target_id": "A2", "volume_l": 5,
+             "operator": "王工"}, ts="2026-09-14T08:00:00Z")
+        self.assertEqual(st, 409)
+        self.assertEqual(err["error"]["code"], "EVENT_TS_OUT_OF_ORDER")
+        # 全部拒绝后不改变当前状态：修订数与装量不变
+        st, after = self.api.get(f"/revisions?facility_id={self.fid}")
+        self.assertEqual(len(after["revisions"]), n_before)
+        st, latest = self.api.get(
+            f"/revisions/latest?facility_id={self.fid}")
+        self.assertEqual(latest["state"]["A1"]["volume_l"], 20)
+        self.assertEqual(latest["state"]["A2"]["volume_l"], 5)
+        self.assertNotIn("transfer_batches", latest["state"]["A2"])
+
+    def test_19_transfer_incompatible_rejected_with_basis(self):
+        self._intake(ACID, "2026-09-14T09:00:00Z")
+        self._intake(CYAN, "2026-09-14T09:05:00Z")
+        st, before = self.api.get(f"/revisions?facility_id={self.fid}")
+        n_before = len(before["revisions"])
+
+        # 预检与正式事件同构拒绝：酸液转入含氰桶 -> R1/HCN
+        st, pc = self.api.post(
+            f"/facilities/{self.fid}/layout/transfer-check",
+            {"matrix_version": "1.0", "transfer": {
+                "source_id": "A1", "target_id": "K1", "volume_l": 5,
+                "operator": "王工"}})
+        self.assertEqual(st, 409)
+        self.assertEqual(pc["error"]["code"], "TRANSFER_INCOMPATIBLE")
+
+        st, err = self._transfer({
+            "source_id": "A1", "target_id": "K1", "volume_l": 5,
+            "operator": "王工", "reason": "误操作尝试"})
+        self.assertEqual(st, 409)
+        self.assertEqual(err["error"]["code"], "TRANSFER_INCOMPATIBLE")
+        d = err["error"]["detail"]
+        self.assertEqual(d["source_id"], "A1")
+        self.assertEqual(d["target_id"], "K1")
+        self.assertIn("R1", d["rules_hit"])
+        self.assertTrue(d["batch_id"])
+        hit = d["conflicts"][0]
+        self.assertEqual(hit["matched_rules"][0]["rule"]["gas"], "HCN")
+        # 状态不变
+        st, after = self.api.get(f"/revisions?facility_id={self.fid}")
+        self.assertEqual(len(after["revisions"]), n_before)
+        st, latest = self.api.get(
+            f"/revisions/latest?facility_id={self.fid}")
+        self.assertEqual(latest["state"]["A1"]["volume_l"], 20)
+        self.assertNotIn("transfer_batches", latest["state"]["K1"])
+
+    def test_20_transfer_reversal_appends_not_rewrites(self):
+        self._intake(ACID, "2026-09-14T09:00:00Z")
+        self._intake_a2()
+        st, resp = self._transfer(
+            {"source_id": "A1", "target_id": "A2", "volume_l": 5,
+             "operator": "王工", "reason": "过桶"},
+            event_id="evt-t1")
+        self.assertEqual(st, 201, resp)
+        rev1 = resp["revisions"][0]["revision_id"]
+        fp1 = resp["revisions"][0]["fingerprint"]
+
+        # 同方向“更正”被拒绝：反向/补偿必须方向相反
+        st, err = self._transfer(
+            {"source_id": "A1", "target_id": "A2", "volume_l": 5,
+             "operator": "王工", "reversal_of": "evt-t1"},
+            ts="2026-09-14T10:30:00Z")
+        self.assertEqual(st, 422)
+        self.assertEqual(err["error"]["code"], "TRANSFER_REVERSAL_INVALID")
+
+        # 追加反向事件更正：A2 -> A1，数量恢复
+        st, resp2 = self._transfer(
+            {"source_id": "A2", "target_id": "A1", "volume_l": 5,
+             "operator": "王工", "reason": "发现误转，回退",
+             "reversal_of": "evt-t1"},
+            ts="2026-09-14T11:00:00Z")
+        self.assertEqual(st, 201, resp2)
+        rev2 = resp2["revisions"][0]["revision_id"]
+        st, rev = self.api.get(f"/revisions/{rev2}")
+        self.assertEqual(rev["state"]["A1"]["volume_l"], 20)
+        self.assertEqual(rev["state"]["A2"]["volume_l"], 5)
+        a1_batches = rev["state"]["A1"]["transfer_batches"]
+        self.assertEqual(a1_batches[-1]["reversal_of"], "evt-t1")
+        self.assertEqual(a1_batches[-1]["reason"], "发现误转，回退")
+        # 历史修订不可改写：rev1 仍记录转移后的 15L，指纹不变
+        st, old = self.api.get(f"/revisions/{rev1}")
+        self.assertEqual(old["state"]["A1"]["volume_l"], 15)
+        self.assertEqual(old["result"]["fingerprint"], fp1)
+        # 反向转移后两桶体积闭合
+        st, sh = self.api.get(f"/revisions/{rev2}/disposal?container_id=A1")
+        self.assertTrue(sh["transfer_batch_check"]["volume_closure"]
+                        ["closed"])
+
+    def test_21_transfer_fill_overflow_rechecked_pending(self):
+        # 转移后目标桶装填率超限：事件落库，但重套冻结矩阵后为待处置
+        self._intake(ACID, "2026-09-14T09:00:00Z")
+        self._intake_a2(vol=20)
+        st, resp = self._transfer({"source_id": "A1", "target_id": "A2",
+                                   "volume_l": 5, "operator": "王工"})
+        self.assertEqual(st, 201, resp)
+        self.assertEqual(resp["latest"], "pending")
+        st, rev = self.api.get(
+            f"/revisions/latest?facility_id={self.fid}")
+        iss = next(i for i in rev["result"]["issues"]
+                   if i["code"] == "FILL_OVERFLOW")
+        self.assertEqual(iss["containers"], ["A2"])
+        self.assertAlmostEqual(iss["basis"]["fill_ratio"], 1.0)
+
+    def test_22_transfer_batches_rechecked_under_new_matrix(self):
+        # v1.0 下允许的转移（酸入重金属桶），矩阵升级 v2.0 后批次自检命中 R8
+        hm = {"id": "H1",
+              "components": [{"name": "lead", "conc_min": 2, "conc_max": 4}],
+              "hazard_classes": ["heavy_metal"], "material": "hdpe",
+              "capacity_l": 30, "volume_l": 20,
+              "position": {"cabinet_id": "CAB-A", "zone_id": "Z-other",
+                           "tray_id": "T-o1"}}
+        self._intake(ACID, "2026-09-14T09:00:00Z")
+        self._intake(hm, "2026-09-14T09:05:00Z")
+        st, resp = self._transfer({"source_id": "A1", "target_id": "H1",
+                                   "volume_l": 3, "operator": "王工"})
+        self.assertEqual(st, 201, resp)
+        self.assertEqual(resp["latest"], "disposable", resp)
+        # 任一后续事件若指定 v2.0 矩阵，重算后批次禁配浮现
+        st, resp2 = self.api.post(
+            f"/facilities/{self.fid}/events",
+            {"matrix_version": "2.0", "event": {
+                "ts": "2026-09-14T11:00:00Z", "type": "move",
+                "container_id": "A1",
+                "payload": {"position": ACID["position"]}}})
+        self.assertEqual(st, 201, resp2)
+        self.assertEqual(resp2["latest"], "pending")
+        st, rev = self.api.get(
+            f"/revisions/latest?facility_id={self.fid}")
+        iss = [i for i in rev["result"]["issues"]
+               if i["code"] == "TRANSFER_BATCH_INCOMPATIBLE"]
+        self.assertTrue(iss)
+        self.assertEqual(iss[0]["basis"]["rule_id"], "R8")
+        self.assertEqual(iss[0]["basis"]["container"], "H1")
+        # 处置单给出整改建议
+        st, sh = self.api.get(
+            f"/revisions/{rev['revision_id']}/disposal?container_id=H1")
+        self.assertTrue(any("反向" in a or "补偿" in a
+                            for a in sh["required_actions"]))
+
 
 if __name__ == "__main__":
     unittest.main()

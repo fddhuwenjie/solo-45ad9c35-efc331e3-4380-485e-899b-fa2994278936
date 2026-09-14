@@ -19,6 +19,9 @@ from . import matrix as M
 
 EPS = 1e-9
 
+# 部分转移批次体积闭合容差（L）：逐步四舍五入到 6 位小数的累积误差上限
+TRANSFER_VOL_TOL = 1e-4
+
 
 def canonical(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
@@ -478,6 +481,15 @@ def evaluate_layout(matrix: Dict[str, Any], facility: Dict[str, Any],
             merge_details.append(md)
             issues.extend(md.pop("_issues"))
 
+    # ---- 部分转移批次自检：桶内各批次两两禁配 + 批次体积闭合 ------------ #
+    transfer_details = []
+    for c in containers:
+        batches = c.get("transfer_batches")
+        if batches:
+            td = _evaluate_transfer_batches(matrix, c, batches)
+            transfer_details.append(td)
+            issues.extend(td.pop("_issues"))
+
     # ---- 托盘盛漏核算 ---------------------------------------------------- #
     tray_details = _evaluate_trays(matrix, spatial, containers, located)
     for td in tray_details:
@@ -510,6 +522,8 @@ def evaluate_layout(matrix: Dict[str, Any], facility: Dict[str, Any],
             "declared": inferred[cid]["declared"],
             "fill_ratio": ratio_safe,
             "material": M.normalize_material(matrix, c.get("material", "")),
+            "transfer_batch_count": len(c.get("transfer_batches") or []),
+            "transfer_out_count": len(c.get("transfers_out") or []),
             "issues": [issues[k]["code"] for k in my_issues],
             "disposition": ("pending"
                             if any(issues[k]["blocking"] for k in my_issues)
@@ -553,6 +567,7 @@ def evaluate_layout(matrix: Dict[str, Any], facility: Dict[str, Any],
             } for cid in ids},
             "pairs": pair_details,
             "merges": merge_details,
+            "transfers": transfer_details,
             "trays": tray_details,
         },
         "fingerprint": result_fingerprint,
@@ -571,6 +586,9 @@ def _container_basis(c: Dict[str, Any]) -> Dict[str, Any]:
         "position": c.get("position"),
         # 合并桶的禁配自检依赖叶级溯源，须纳入复算指纹输入
         "merge_provenance": c.get("merge_provenance"),
+        # 部分转移的批次溯源与转出记录同样决定复核结果，纳入指纹
+        "transfer_batches": c.get("transfer_batches"),
+        "transfers_out": c.get("transfers_out"),
     }
 
 
@@ -903,6 +921,166 @@ def merge_containers(target: Dict[str, Any],
 
 
 # --------------------------------------------------------------------------- #
+# 部分转移：准入预检（转入液 vs 目标桶现存批次的禁配命中）
+# --------------------------------------------------------------------------- #
+def transfer_conflicts(matrix: Dict[str, Any],
+                       aliquot_components: Sequence[Dict[str, Any]],
+                       target: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """计算待转入液与目标桶现存内容物的禁配命中（纯计算，供事件准入预检）。
+
+    目标桶已有转移批次链时逐批次核对（批次成分即转入时冻结的成分），
+    否则与其当前成分核对。返回命中清单（空 = 可转入）。确定命中与
+    可能命中（浓度范围高端才触发）都返回，由调用方从严拒绝。
+    """
+    cls_a = classify_components(matrix, aliquot_components)
+    if target.get("transfer_batches"):
+        checks = [(b.get("batch_id"), b.get("components", []))
+                  for b in target["transfer_batches"]]
+    else:
+        checks = [("(当前成分)", target.get("components", []))]
+    conflicts: List[Dict[str, Any]] = []
+    for bid, comps in checks:
+        cls_b = classify_components(matrix, comps)
+        matched: Dict[str, Dict[str, Any]] = {}
+        for x, y in product(cls_a["definite"], cls_b["definite"]):
+            r = M.find_reaction(matrix, x, y)
+            if r:
+                matched[r["id"]] = {"rule_id": r["id"], "class_pair": [x, y],
+                                    "definite": True, "rule": r}
+        possible: Dict[str, Dict[str, Any]] = {}
+        for x, y in product(cls_a["possible"], cls_b["possible"]):
+            r = M.find_reaction(matrix, x, y)
+            if r and r["id"] not in matched:
+                possible[r["id"]] = {"rule_id": r["id"], "class_pair": [x, y],
+                                     "definite": False, "rule": r}
+        if matched or possible:
+            conflicts.append({
+                "against_batch_id": bid,
+                "matched_rules": list(matched.values()),
+                "possible_rules": list(possible.values())})
+    return conflicts
+
+
+# --------------------------------------------------------------------------- #
+# 部分转移批次自检：同一桶内各批次两两核查禁配（比泄漏共置更严格），
+# 并校验“基线批次 + 转入 − 转出 = 当前装量”的体积闭合
+# --------------------------------------------------------------------------- #
+def _evaluate_transfer_batches(matrix: Dict[str, Any],
+                               target: Dict[str, Any],
+                               batches: List[Dict[str, Any]]) -> Dict[str, Any]:
+    tid = target["id"]
+    out: Dict[str, Any] = {
+        "container": tid,
+        "position": target.get("position"),
+        "batches": batches,
+        "transfers_out": target.get("transfers_out", []),
+        "volume_closure": None,
+        "pair_checks": [],
+        "_issues": [],
+    }
+
+    # ---- 体积闭合：基线批次 + Σ转入 − Σ转出 必须等于当前装量 ------------- #
+    def _vol(x: Any) -> float:
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return 0.0
+
+    base_vol = sum(_vol(b.get("volume_l")) for b in batches
+                   if b.get("kind") == "base")
+    in_vol = sum(_vol(b.get("volume_l")) for b in batches
+                 if b.get("kind") != "base")
+    out_vol = sum(_vol(t.get("volume_l"))
+                  for t in target.get("transfers_out", []))
+    expected = round(base_vol + in_vol - out_vol, 6)
+    try:
+        actual_f: Optional[float] = float(target.get("volume_l"))
+    except (TypeError, ValueError):
+        actual_f = None
+    closed = (actual_f is not None
+              and abs(expected - actual_f) <= TRANSFER_VOL_TOL)
+    closure = {
+        "base_l": round(base_vol, 6),
+        "transferred_in_l": round(in_vol, 6),
+        "transferred_out_l": round(out_vol, 6),
+        "expected_l": expected,
+        "actual_l": actual_f,
+        "tolerance_l": TRANSFER_VOL_TOL,
+        "closed": closed,
+        "formula": "base_l + Σtransfer_in − Σtransfer_out = volume_l",
+    }
+    out["volume_closure"] = closure
+    if not closed:
+        out["_issues"].append(_issue(
+            "TRANSFER_VOLUME_MISMATCH", "blocker", "container",
+            f"{tid} 转移批次体积不闭合: 批次推算 {expected}L ≠ 当前装量 "
+            f"{actual_f}L（容差 {TRANSFER_VOL_TOL}L）",
+            [tid], {tid: target.get("position")}, closure))
+
+    # ---- 批次两两禁配：桶内直接混合，任何反应规则都构成禁配 ------------- #
+    leaf_cls = [classify_components(matrix, b.get("components", []))
+                for b in batches]
+    for i in range(len(batches)):
+        for j in range(i + 1, len(batches)):
+            ba, bb = batches[i], batches[j]
+            ca, cb = leaf_cls[i], leaf_cls[j]
+            check: Dict[str, Any] = {
+                "batch_pair": [ba.get("batch_id"), bb.get("batch_id")],
+                "origins": {ba.get("batch_id"): ba.get("from_container"),
+                            bb.get("batch_id"): bb.get("from_container")},
+                "matched_rules": [],
+                "possible_rules": [],
+                "violations": [],
+            }
+            matched: Dict[str, Dict[str, Any]] = {}
+            for x, y in product(ca["definite"], cb["definite"]):
+                r = M.find_reaction(matrix, x, y)
+                if r:
+                    matched[r["id"]] = {"rule_id": r["id"],
+                                        "class_pair": [x, y],
+                                        "definite": True}
+            possible: Dict[str, Dict[str, Any]] = {}
+            for x, y in product(ca["possible"], cb["possible"]):
+                r = M.find_reaction(matrix, x, y)
+                if r and r["id"] not in matched:
+                    possible[r["id"]] = {"rule_id": r["id"],
+                                         "class_pair": [x, y],
+                                         "definite": False}
+            check["matched_rules"] = list(matched.values())
+            check["possible_rules"] = list(possible.values())
+            rules = [(rid, next(x for x in matrix["reactions"]
+                                if x["id"] == rid), True)
+                     for rid in matched]
+            rules += [(rid, next(x for x in matrix["reactions"]
+                                 if x["id"] == rid), False)
+                      for rid in possible]
+            for rid, rule, definite in rules:
+                sev = rule["severity"]
+                gas = f"，释放 {rule['gas']}" if rule.get("gas") else ""
+                code = ("TRANSFER_BATCH_INCOMPATIBLE" if definite
+                        else "TRANSFER_BATCH_POSSIBLY_INCOMPATIBLE")
+                check["violations"].append({
+                    "rule_id": rid, "definite": definite,
+                    "severity": sev, "gas": rule.get("gas")})
+                out["_issues"].append(_issue(
+                    code, "blocker", "container",
+                    f"桶 {tid} 内转移批次禁配: 批次 {ba.get('batch_id')} 与 "
+                    f"{bb.get('batch_id')} 命中规则 {rid}（{sev}{gas}："
+                    f"{rule.get('note', '')}）",
+                    [tid], {tid: target.get("position")},
+                    {"rule_id": rid, "rule": rule, "definite": definite,
+                     "container": tid,
+                     "batch_pair": [ba.get('batch_id'), bb.get('batch_id')],
+                     "batch_origins": check["origins"],
+                     "batch_volumes_l": {
+                         ba.get("batch_id"): ba.get("volume_l"),
+                         bb.get("batch_id"): bb.get("volume_l")},
+                     "mixed_context": "in_container_transfer"}))
+            out["pair_checks"].append(check)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # 版本比较：矩阵 diff 与 修订结果 diff
 # --------------------------------------------------------------------------- #
 def _issue_key(iss: Dict[str, Any]) -> str:
@@ -950,6 +1128,37 @@ def diff_results(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
                 chg["change"] = "unchanged"
         container_changes.append(chg)
 
+    # 部分转移活动：逐桶对比批次链，列出新增的批次（含操作者与人工理由），
+    # 使版本差异无需翻事件日志即可还原每次转移
+    def _transfer_map(res: Dict[str, Any]) -> Dict[str, Any]:
+        return {t["container"]: t
+                for t in res.get("calculation", {}).get("transfers", [])}
+
+    old_tm, new_tm = _transfer_map(old), _transfer_map(new)
+    transfer_activity = []
+    for cid in sorted(set(old_tm) | set(new_tm)):
+        o, n = old_tm.get(cid), new_tm.get(cid)
+        o_ids = {b.get("batch_id") for b in o["batches"]} if o else set()
+        n_batches = n["batches"] if n else []
+        added = [b for b in n_batches if b.get("batch_id") not in o_ids]
+        if not added and (o is None) == (n is None):
+            continue
+        transfer_activity.append({
+            "container_id": cid,
+            "batches_old": len(o["batches"]) if o else 0,
+            "batches_new": len(n_batches),
+            "added_batches": [{
+                "batch_id": b.get("batch_id"),
+                "ts": b.get("ts"),
+                "event_id": b.get("event_id"),
+                "from_container": b.get("from_container"),
+                "volume_l": b.get("volume_l"),
+                "operator": b.get("operator"),
+                "reason": b.get("reason"),
+                "reversal_of": b.get("reversal_of"),
+            } for b in added],
+        })
+
     return {
         "matrix_version": {"old": old.get("matrix_version"),
                            "new": new.get("matrix_version")},
@@ -963,6 +1172,7 @@ def diff_results(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
         "issues_persisted": [brief(new_map[k]) for k in persisted],
         "summary": {"old": old.get("summary"), "new": new.get("summary")},
         "container_changes": container_changes,
+        "transfer_activity": transfer_activity,
     }
 
 
